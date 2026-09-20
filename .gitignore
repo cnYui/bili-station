@@ -23,3 +23,6 @@ chrome-profile/
 .DS_Store
 Thumbs.db
 *.swp
+
+# 本地上下文文档，不进仓库
+CLAUDE.md

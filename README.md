@@ -1,5 +1,7 @@
 # B 站本地整理台
 
+**中文** · [English](README.en.md)
+
 本地运行的 B 站账号整理工具，带可视化页面。关注清理 / 关注分组 / 收藏夹分类 / 失效视频清理。
 
 **所有写操作都经 CDP 在你已登录的 Chrome 页面里发出**，请求带完整浏览器指纹（buvid3/4、bili_ticket、Sec-Fetch-*），
@@ -65,7 +67,7 @@ npm start         # 起本地服务
 
 ```bash
 npm test          # 63 条纯逻辑断言，不需要 Chrome 也不需要登录
-npm run test:e2e  # 40 条端到端断言：假 B 站后端，全确定性，不需要 key 也不花钱
+npm run test:e2e  # 59 条端到端断言：假 B 站后端，全确定性，不需要 key 也不花钱
 ```
 
 ## 目录
