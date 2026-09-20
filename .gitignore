@@ -1,0 +1,25 @@
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# 运行期数据全部落在 ~/.bili-station/，不应进仓库。
+# 这里再兜一层，防止有人把数据目录软链或复制进项目。
+.bili-station/
+config.json
+favorites.json
+follow.json
+special.json
+risk-history.json
+folder-map.json
+resume-*.json
+backups/
+
+# Chrome 调试用的独立用户资料目录
+chrome-profile/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp

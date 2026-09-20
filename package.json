@@ -1,0 +1,29 @@
+{
+  "name": "bili-station",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "本地 B 站账号整理台：关注清理 / 分组管理 / 收藏夹分类 / 失效视频清理。请求经 CDP 在已登录 Chrome 页面内发出。",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "chrome": "node scripts/launch-chrome.mjs",
+    "test": "node selftest.mjs",
+    "cli": "node cli.mjs",
+    "test:e2e": "node test-sort-flow.mjs"
+  },
+  "bin": {
+    "bili-station": "./cli.mjs"
+  },
+  "files": [
+    "cli.mjs",
+    "server.mjs",
+    "src",
+    "web",
+    "scripts",
+    "README.md",
+    "AGENTS.md"
+  ]
+}

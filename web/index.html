@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B 站本地整理台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+
+  <nav class="side">
+    <div class="brand">B 站整理台<small>本地运行<br>经已登录 Chrome 发请求</small></div>
+    <button class="navbtn" data-tab="connect" aria-current="page"><span class="dot"></span>连接与总览</button>
+    <button class="navbtn" data-tab="follow"><span class="dot"></span>关注清理</button>
+    <button class="navbtn" data-tab="tags"><span class="dot"></span>关注分组</button>
+    <button class="navbtn" data-tab="fav"><span class="dot"></span>收藏夹分类</button>
+    <button class="navbtn" data-tab="dead"><span class="dot"></span>失效视频</button>
+    <button class="navbtn" data-tab="settings"><span class="dot"></span>设置</button>
+    <div class="side-foot">
+      <div id="whoami">未连接</div>
+      <div class="spacer"></div>
+      <button class="act" id="theme-toggle" style="width:100%">切换深浅色</button>
+    </div>
+  </nav>
+
+  <main class="main">
+
+    <!-- ========== 连接与总览 ========== -->
+    <section class="panel active" data-panel="connect">
+      <h1>连接与总览</h1>
+      <p class="sub">所有写操作都在你已登录的 Chrome 页面里发出，带完整浏览器指纹，比本地直连的风控命中率低得多。</p>
+
+      <div class="card">
+        <h2>1 · 启动带调试端口的 Chrome</h2>
+        <p class="hint">在项目目录执行下面这条，它会用独立 profile 开一个 Chrome（不影响你日常那个），在里面登录 B 站即可。</p>
+        <code class="mono" style="display:block;padding:9px 11px;background:var(--plane);border-radius:7px;font-size:12px">npm run chrome</code>
+      </div>
+
+      <div class="card">
+        <h2>2 · 连接</h2>
+        <div class="row">
+          <button class="act primary" id="btn-connect">连接 Chrome</button>
+          <span id="conn-state" class="muted">检测中…</span>
+        </div>
+      </div>
+
+      <div class="tiles" id="tiles"></div>
+
+      <div class="card">
+        <h2>账号写操作热度</h2>
+        <p class="hint">按 45 分钟半衰期对 24 小时内的写操作加权衰减计分。热度越高，工具自动把操作间隔拉得越长；到 red 会建议你停手。</p>
+        <div class="meter-wrap">
+          <div class="meter">
+            <div class="meter-track"><div class="meter-fill" id="heat-fill" style="width:0%"></div></div>
+            <div class="meter-legend"><span>0 空闲</span><span>30</span><span>60</span><span>80</span><span>100 危险</span></div>
+          </div>
+          <span class="status-chip" id="heat-chip"><span class="glyph">●</span><span id="heat-label">green · 0/100</span></span>
+        </div>
+        <div class="spacer"></div>
+        <div id="heat-detail" class="muted" style="font-size:12px"></div>
+      </div>
+
+      <div class="card">
+        <h2>数据抓取</h2>
+        <p class="hint">读操作也会被限流，工具已在每次请求间加了随机间隔。抓完的数据会落到本地，后续规划不再重复请求。</p>
+        <div class="row">
+          <button class="act" id="btn-scan-follow">拉取关注列表</button>
+          <button class="act" id="btn-scan-fav">拉取全部收藏夹</button>
+          <button class="act" id="btn-scan-uploads">探测 UP 最近投稿（用于识别停更号）</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== 关注清理 ========== -->
+    <section class="panel" data-panel="follow">
+      <h1>关注清理</h1>
+      <p class="sub">特别关注永远保留。先生成计划看清楚要动谁，确认无误再执行。</p>
+
+      <div class="card">
+        <h2>筛选规则</h2>
+        <div class="row">
+          <div class="field"><label>保留最近关注的前 N 个</label><input type="number" id="f-keep" value="500" min="0"></div>
+          <div class="field"><label>超过多少天没投稿算停更</label><input type="number" id="f-days" value="365" min="0"></div>
+          <label class="check"><input type="checkbox" id="f-only-inactive">只取关停更号（忽略上面的 N）</label>
+        </div>
+        <div class="spacer"></div>
+        <div class="row">
+          <button class="act primary" id="btn-plan-unfollow">生成计划</button>
+          <label class="check"><input type="checkbox" id="f-dry" checked>干跑（只预览，不真的取关）</label>
+          <button class="act danger" id="btn-run-unfollow" disabled>执行</button>
+        </div>
+      </div>
+
+      <div id="unfollow-result"></div>
+    </section>
+
+    <!-- ========== 关注分组 ========== -->
+    <section class="panel" data-panel="tags">
+      <h1>关注分组</h1>
+      <p class="sub">把关注的 UP 主批量打上分组标签。分组是 B 站官方能力，跨设备同步。</p>
+      <div class="card">
+        <h2>现有分组</h2>
+        <div id="tag-list" class="muted">连接后自动读取</div>
+      </div>
+      <div class="card">
+        <h2>说明</h2>
+        <p class="hint">批量分组的规则编辑器还没接上界面（后端 <span class="mono">buildTagOps</span> 已就绪）。先把关注列表拉下来，这块我下一轮补。</p>
+      </div>
+    </section>
+
+    <!-- ========== 收藏夹分类 ========== -->
+    <section class="panel" data-panel="fav">
+      <h1>收藏夹分类</h1>
+      <p class="sub">先用<strong>复制模式</strong>把结果试出来确认分得对，再切移动模式——复制是可逆的，移动不是。</p>
+
+      <div class="card">
+        <h2>分类方式</h2>
+        <div class="row">
+          <div class="field"><label>方式</label>
+            <select id="v-method">
+              <option value="keyword">关键词规则（本地 · 免费 · 可复现）</option>
+              <option value="ai">AI 语义分类（需 API Key）</option>
+            </select>
+          </div>
+          <div class="field"><label>操作模式</label>
+            <select id="v-mode">
+              <option value="copy">复制（安全，可回退）</option>
+              <option value="move">移动（不可逆）</option>
+            </select>
+          </div>
+          <label class="check"><input type="checkbox" id="v-keep-unmatched">未命中的不动它（不建「待分类」）</label>
+        </div>
+        <div class="spacer"></div>
+        <div class="row">
+          <button class="act primary" id="btn-plan-fav">生成分类计划</button>
+          <label class="check"><input type="checkbox" id="v-dry" checked>干跑</label>
+          <button class="act danger" id="btn-run-fav" disabled>执行</button>
+        </div>
+      </div>
+
+      <div id="fav-result"></div>
+    </section>
+
+    <!-- ========== 失效视频 ========== -->
+    <section class="panel" data-panel="dead">
+      <h1>失效视频</h1>
+      <p class="sub">收藏夹里被删除、转私密或下架的条目。建议先归档到一个夹里，别直接删——归档能反悔。</p>
+      <div class="card">
+        <div class="row">
+          <div class="field"><label>处理方式</label>
+            <select id="d-action">
+              <option value="archive">归档到一个收藏夹（可反悔）</option>
+              <option value="remove">直接从收藏夹移除（不可逆）</option>
+            </select>
+          </div>
+          <div class="field"><label>归档夹名称</label><input type="text" id="d-name" value="已失效视频归档"></div>
+        </div>
+        <div class="spacer"></div>
+        <div class="row">
+          <button class="act primary" id="btn-plan-dead">扫描失效视频</button>
+          <label class="check"><input type="checkbox" id="d-dry" checked>干跑</label>
+          <button class="act danger" id="btn-run-dead" disabled>执行</button>
+        </div>
+      </div>
+      <div id="dead-result"></div>
+    </section>
+
+    <!-- ========== 设置 ========== -->
+    <section class="panel" data-panel="settings">
+      <h1>设置</h1>
+      <p class="sub">配置存在本地数据目录，API Key 不会出现在任何导出或备份里。</p>
+
+      <div class="card">
+        <h2>连接与配额</h2>
+        <div class="row">
+          <div class="field"><label>Chrome 调试端口</label><input type="number" id="s-port" value="9222"></div>
+          <div class="field"><label>收藏夹个数上限（用于预检）</label><input type="number" id="s-quota" value="20"></div>
+          <div class="field"><label>单个收藏夹容量上限</label><input type="number" id="s-cap" value="1000"></div>
+          <div class="field"><label>新建收藏夹隐私</label>
+            <select id="s-privacy"><option value="1">私密</option><option value="0">公开</option></select>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>风控参数</h2>
+        <p class="hint">默认值是把 12 个同类项目里被实测验证过的做法合起来取的保守值。不确定就别动。</p>
+        <div class="row">
+          <div class="field"><label>最小间隔 ms</label><input type="number" id="s-min" value="1800"></div>
+          <div class="field"><label>最大间隔 ms</label><input type="number" id="s-max" value="3500"></div>
+          <div class="field"><label>单轮写操作硬上限</label><input type="number" id="s-cap-round" value="100"></div>
+          <div class="field"><label>每多少次歇一轮</label><input type="number" id="s-batch" value="20"></div>
+          <label class="check"><input type="checkbox" id="s-stop" checked>撞风控立即停止整轮（推荐）</label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>AI 分类</h2>
+        <div class="row">
+          <div class="field"><label>供应商</label>
+            <select id="s-provider">
+              <option value="deepseek">DeepSeek</option>
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+              <option value="gemini">Google Gemini</option>
+              <option value="moonshot">Moonshot Kimi</option>
+              <option value="zhipu">智谱 GLM</option>
+              <option value="dashscope">阿里通义</option>
+              <option value="siliconflow">SiliconFlow</option>
+              <option value="openrouter">OpenRouter</option>
+              <option value="ollama">Ollama（本地）</option>
+            </select>
+          </div>
+          <div class="field"><label>API Key</label><input type="password" id="s-key" placeholder="留空则用已保存的"></div>
+          <div class="field"><label>模型（留空用默认）</label><input type="text" id="s-model" placeholder="如 deepseek-chat"></div>
+          <div class="field"><label>每片条数</label><input type="number" id="s-chunk" value="25"></div>
+          <div class="field"><label>并发</label><input type="number" id="s-conc" value="2" min="1" max="5"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <button class="act primary" id="btn-save-cfg">保存设置</button>
+          <button class="act" id="btn-clear-resume">清空断点续跑记录</button>
+          <span class="muted" id="cfg-msg"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>备份</h2>
+        <p class="hint">每次真正执行前都会自动快照一份当前状态，永不覆盖。</p>
+        <div id="backup-list" class="muted">—</div>
+      </div>
+    </section>
+
+    <!-- ========== 日志 ========== -->
+    <div class="logwrap">
+      <div class="logbar">
+        <span class="title">实时日志</span>
+        <div class="progress"><div id="prog"></div></div>
+        <span class="muted mono" id="prog-text" style="font-size:11.5px"></span>
+        <span style="flex:1"></span>
+        <button class="act" id="btn-pause" disabled>暂停</button>
+        <button class="act" id="btn-stop" disabled>停止</button>
+        <button class="act" id="btn-clear-log">清屏</button>
+      </div>
+      <div id="log"></div>
+    </div>
+
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

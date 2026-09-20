@@ -1,0 +1,93 @@
+# 给 agent 的操作说明
+
+这个仓库提供 `bili-station` CLI，用来整理用户的 B 站账号（收藏夹分类、关注清理）。
+你（Claude / Codex 等）可以直接调用它。**动手前先读完这一页。**
+
+## 硬性规则
+
+1. **任何写操作都必须先干跑。** 不加 `--yes` 就是干跑。先跑一次不带 `--yes` 的，把计划念给用户听，
+   得到明确同意后再加 `--yes` 重跑同一条命令。**绝不要自己替用户决定执行。**
+2. **默认用 `--mode copy`。** 只有用户明确说要移动时才用 `--mode move`——移动不可逆。
+3. **先小批量试。** 第一次带 `--yes` 时加 `--limit 30`，让用户看过结果再放开。
+4. **退出码 2（风控中止）时停手。** 不要重试、不要换参数再冲。告诉用户等一段时间（建议 1 小时以上）再继续。
+5. **退出码 3（登录失效）时停手。** 让用户去 Chrome 里重新登录，不要尝试任何绕过。
+6. 所有命令加 `--json`，stdout 会是单个 JSON 对象，stderr 是进度日志。
+
+## 前置条件
+
+```bash
+npm run chrome        # 开一个带调试端口的 Chrome，用户需在里面登录 B 站
+bili-station status --json
+```
+
+`status` 返回 `loggedIn: false` 就别往下走，先让用户完成上面两步。
+
+## 收藏夹分类的标准流程
+
+核心约束：**候选收藏夹由用户定，分类只能从候选里选唯一一个，不允许发明新分类。**
+**分类由你来做**（默认 `--engine external`），CLI 不外挂模型、不需要任何 API key。
+
+```bash
+# 1. 看现状，把现有收藏夹念给用户，问他想分成哪几类
+bili-station status --json
+
+# 2. 拿待分类清单。stdout 是 {candidates, instruction, items}
+bili-station sort --folders "编程开发,游戏,美食烹饪,科普知识" --emit-tasks tasks.json --json
+
+# 3. 你来分类：给每条选一个 candidates 里的分类名，写成 {"<视频id>":"<分类名>"} 存成 assign.json
+
+# 4. 干跑看计划
+bili-station sort --folders "编程开发,游戏,美食烹饪,科普知识" --assign assign.json --json
+
+# 5. 把计划念给用户（每类多少条、会新建哪几个夹、有没有 warnings），等他确认
+
+# 6. 小批量执行
+bili-station sort --folders "编程开发,游戏,美食烹饪,科普知识" --assign assign.json --limit 30 --yes --json
+
+# 7. 用户满意后放开
+bili-station sort --folders "编程开发,游戏,美食烹饪,科普知识" --assign assign.json --yes --json
+```
+
+分类时只看 `items` 里的 `title` / `up` / `intro`。**分类名必须与 candidates 逐字一致**
+（大小写和首尾空格会被容忍，别的不会）。不在候选集里的会被**拒收**而不是静默乱放——
+结果里的 `rejected` 不为 0 就说明你给错了名字，看 stderr 里列出的拒收项，改完重来。
+`missing` 是你漏给的条数。
+
+常用变体：
+- `--include-existing` 把用户现有的收藏夹也纳入候选（多数情况下用户想要这个）
+- `--source 101,102` 只处理指定来源夹；默认 `all` 且会自动排除候选夹本身
+- `--lazy-create` 只创建真正分到视频的夹，避免留下空夹
+
+不想自己分类时还有两条路，但**都不是默认**：
+- `--engine keyword` 本地关键词规则
+- `--engine deepseek` CLI 自己调模型，需要用户自备 `DEEPSEEK_API_KEY`；没有就别提这条路
+
+## 关注清理
+
+```bash
+bili-station scan follow --json
+bili-station unfollow --keep 500 --json                   # 干跑
+bili-station unfollow --keep 500 --yes --json             # 执行
+bili-station unfollow --only-inactive --inactive-days 365 --json
+```
+
+特别关注无条件保留，不受任何参数影响。
+
+注意结果里的 `truncated`：为 true 说明 B 站的分页深度限制导致关注列表**没拉全**，
+这时 `total` 和实际处理数对不上是正常的，要如实告诉用户，别说成「已全部清理」。
+
+## 需要如实转述给用户的字段
+
+- `warnings[]` —— 配额/容量预警。特别是 `folder-quota`：**配额满时 B 站的报错长得像限流，其实不是**，别误导用户以为是风控。
+- `needReview` —— 置信度偏低、建议人工复核的条数。
+- `truncated` —— 关注列表是否没拉全。
+- `result.riskHits` —— 本轮命中风控几次。不为 0 就要提醒用户放慢。
+- `status` 为 `stopped` —— 是撞风控主动停的，不是跑完了。
+
+## 不要做的事
+
+- 不要为了「跑快点」去改 `~/.bili-station/config.json` 里的风控参数。
+- 不要在失败后循环重试；执行器内部已有退避，外层再重试只会加重风控。
+- 不要把 `~/.bili-station/config.json` 的内容打印出来（可能有 API key）。
+- 不要替用户去申请、填写或硬编码任何 API key。默认路径根本不需要 key。
+- 不要用 `--mode move` 做第一次尝试。
