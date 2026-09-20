@@ -5,6 +5,7 @@
 import { RiskEngine, classifyResult, sleep } from './risk.mjs';
 import * as store from './store.mjs';
 import { chunk, toResource } from './plan.mjs';
+import { orderItems, chunkBySource } from './order.mjs';
 
 export class Job {
   constructor(id, kind, { dryRun = true, riskOpts = {}, resumeKey = null } = {}) {
@@ -205,6 +206,89 @@ export function buildUnfollowOps(bili, targets) {
   }));
 }
 
+/**
+ * 关系变更（关注 / 取关 / 悄悄关注 / 取消悄悄关注）。
+ * 每个 mid 单独成 op —— 关系接口没有批量形式，而且权重高，逐个做才好控速。
+ */
+export function buildRelationOps(bili, targets, act, { opName = 'follow', verb = '操作', reasons = null } = {}) {
+  return targets.map((u) => ({
+    key: opName + ':' + act + ':' + u.mid,
+    label: verb + ' ' + (u.uname ?? u.mid) + '（UID ' + u.mid + '）'
+      + (reasons?.get(String(u.mid)) ? ' — ' + reasons.get(String(u.mid)) : ''),
+    op: opName,
+    run: () => bili.modifyRelation(u.mid, act),
+  }));
+}
+
+/** 分组本身的增删改。逐个做，权重按 tagEdit 计。 */
+export function buildTagAdminOps(bili, { creates = [], renames = [], deletes = [] } = {}, tagIds = new Map()) {
+  const ops = [];
+  for (const name of creates) {
+    ops.push({
+      label: '新建分组「' + name + '」',
+      op: 'tagEdit',
+      run: async () => {
+        // 幂等：先看是不是已经存在（重跑 / 上次建到一半）
+        const fresh = await bili.tags();
+        const hit = fresh.find((t) => String(t.name).trim() === String(name).trim());
+        if (hit) { tagIds.set(name, hit.tagid); return { code: 0, data: { tagid: hit.tagid }, _reused: true }; }
+        const body = await bili.createTag(name);
+        const id = body?.data?.tagid ?? body?.data?.tag_id;
+        if (body?.code === 0 && id != null) tagIds.set(name, id);
+        return body;
+      },
+    });
+  }
+  for (const r of renames) {
+    ops.push({
+      key: 'tagRename:' + r.tagid + ':' + r.to,
+      label: '分组改名「' + r.from + '」→「' + r.to + '」',
+      op: 'tagEdit',
+      run: () => bili.renameTag(r.tagid, r.to),
+    });
+  }
+  for (const d of deletes) {
+    ops.push({
+      key: 'tagDelete:' + d.tagid,
+      label: '删除分组「' + d.name + '」（组内 UP 不会被取关）',
+      op: 'tagEdit',
+      run: () => bili.deleteTag(d.tagid),
+    });
+  }
+  return ops;
+}
+
+/**
+ * 设置用户的**完整**分组归属。
+ *
+ * setUserTags 是覆盖语义（传进去的就是之后的全部分组），所以调用方必须给出
+ * 完整的目标集合，而不是「要加的那个」。把相同目标集合的 mid 合并成一批发送。
+ *
+ * @param {Map<string, number[]>} desired  mid -> 目标分组 id 列表（空数组 = 回到默认分组）
+ */
+export function buildUserTagOps(bili, desired, { batchSize = 20, labelOf = null } = {}) {
+  const bySig = new Map();
+  for (const [mid, tagids] of desired) {
+    const norm = [...new Set(tagids.map(Number))].sort((a, b) => a - b);
+    const sig = norm.join(',');
+    if (!bySig.has(sig)) bySig.set(sig, { tagids: norm, mids: [] });
+    bySig.get(sig).mids.push(String(mid));
+  }
+  const ops = [];
+  for (const { tagids, mids } of bySig.values()) {
+    for (const part of chunk(mids, batchSize)) {
+      ops.push({
+        key: 'usertags:' + tagids.join('_') + ':' + part.join('_'),
+        label: '把 ' + part.length + ' 个 UP 的分组设为 [' + (labelOf ? tagids.map(labelOf).join(', ') : tagids.join(', ')) + ']',
+        op: 'tagAdd',
+        weight: part.length,
+        run: () => bili.setUserTags(part, tagids),
+      });
+    }
+  }
+  return ops;
+}
+
 /** 批量打分组标签：一次最多塞一批 mid */
 export function buildTagOps(bili, assignments, batchSize = 20) {
   const ops = [];
@@ -226,7 +310,8 @@ export function buildTagOps(bili, assignments, batchSize = 20) {
  * 收藏夹分类：先建所需的新夹，再按批移动/复制。
  * folderIds 是一个 Map<分类名, mediaId>，执行中会被就地补全（新建的夹回填进去）。
  */
-export function buildFavOps(bili, favPlan, folderIds, { mode = 'copy', moveChunk = 20, privacy = 1 } = {}) {
+export function buildFavOps(bili, favPlan, folderIds, { mode = 'copy', moveChunk = 20, privacy = 1, order = 'original', orderScope = 'per-source', chunkSize = null } = {}) {
+  const size = chunkSize ?? moveChunk;
   const ops = [];
   // 建夹的幂等性靠「这个名字的夹是不是真的存在」来保证，而不是靠断点文件。
   // 否则断点说建过了、夹其实不在（被手动删了 / 建到一半失败），后续移动会全部落空。
@@ -262,48 +347,49 @@ export function buildFavOps(bili, favPlan, folderIds, { mode = 'copy', moveChunk
     }
   }
   for (const p of favPlan.plan) {
-    // 同一批里可能混着来自不同源收藏夹的条目，move 接口要求 src 单一，所以按源分组
-    const bySrc = new Map();
-    for (const it of p.items) {
-      const src = it.srcMediaId;
-      if (!bySrc.has(src)) bySrc.set(src, []);
-      bySrc.get(src).push(it);
-    }
-    for (const [src, list] of bySrc) {
-      for (const part of chunk(list, moveChunk)) {
-        ops.push({
-          key: (mode === 'move' ? 'mv:' : 'cp:') + src + ':' + p.category + ':' + part.map((x) => x.id).join('_'),
-          label: (mode === 'move' ? '移动 ' : '复制 ') + part.length + ' 条到「' + p.category + '」',
-          op: 'favMove',
-          weight: 1,
-          run: async () => {
-            const tar = folderIds.get(p.category);
-            if (!tar) return { code: -1, message: '目标收藏夹「' + p.category + '」尚未创建成功，跳过' };
-            const res = part.map(toResource);
-            return mode === 'move'
-              ? bili.moveResources(src, tar, res)
-              : bili.copyResources(src, tar, res);
-          },
-        });
-      }
+    // 提交顺序决定条目在新夹里的排列，见 order.mjs 顶部的推导。
+    // move 接口要求单一 src_media_id，所以切批时必须在来源边界处断开。
+    const ordered = orderItems(p.items, order);
+    for (const { src, items: part } of chunkBySource(ordered, { chunkSize: size, scope: orderScope })) {
+      ops.push({
+        key: (mode === 'move' ? 'mv:' : 'cp:') + src + ':' + p.category + ':' + part.map((x) => x.id).join('_'),
+        label: (mode === 'move' ? '移动 ' : '复制 ') + part.length + ' 条到「' + p.category + '」',
+        op: 'favMove',
+        weight: 1,
+        run: async () => {
+          const tar = folderIds.get(p.category);
+          if (!tar) return { code: -1, message: '目标收藏夹「' + p.category + '」尚未创建成功，跳过' };
+          const res = part.map(toResource);
+          return mode === 'move'
+            ? bili.moveResources(src, tar, res)
+            : bili.copyResources(src, tar, res);
+        },
+      });
     }
   }
   return ops;
 }
 
 /** 失效视频清理 */
-export function buildDeadOps(bili, deadPlan, archiveId, { delChunk = 20 } = {}) {
+export function buildDeadOps(bili, deadPlan, archiveId, { delChunk = 20, order = 'original', chunkSize = null } = {}) {
+  const size = chunkSize ?? delChunk;
   const ops = [];
   for (const g of deadPlan.groups) {
-    for (const part of chunk(g.items, delChunk)) {
+    // 归档时同样决定了条目在归档夹里的排列；移除时排序无意义但也无害
+    for (const part of chunk(orderItems(g.items, order), size)) {
       const res = part.map(toResource);
       ops.push({
         key: deadPlan.action + ':' + g.mediaId + ':' + part.map((x) => x.id).join('_'),
         label: (deadPlan.action === 'archive' ? '归档 ' : '移除 ') + part.length + ' 条失效视频（源夹 ' + g.mediaId + '）',
         op: 'favDeal',
-        run: () => deadPlan.action === 'archive'
-          ? bili.moveResources(g.mediaId, archiveId, res)
-          : bili.batchDel(g.mediaId, res),
+        // archiveId 可以是值，也可以是惰性取值函数 —— 归档夹可能要等前面的建夹 op
+        // 跑完才有 id，和 buildFavOps 里 folderIds 的回填是同一套路子
+        run: () => {
+          if (deadPlan.action !== 'archive') return bili.batchDel(g.mediaId, res);
+          const tar = typeof archiveId === 'function' ? archiveId() : archiveId;
+          if (tar == null) return { code: -1, message: '归档夹尚未创建成功，跳过本批' };
+          return bili.moveResources(g.mediaId, tar, res);
+        },
       });
     }
   }
@@ -314,13 +400,14 @@ export function buildDeadOps(bili, deadPlan, archiveId, { delChunk = 20 } = {}) 
  * 合并：把来源夹的条目搬进目标夹。
  * 失效条目单独成批 —— 万一接口拒收失效条目，不会把同批的正常视频一起拖下水。
  */
-export function buildMergeOps(bili, mergePlan, { chunkSize = 20 } = {}) {
+export function buildMergeOps(bili, mergePlan, { chunkSize = 20, order = 'original' } = {}) {
   const ops = [];
   const tar = mergePlan.target.id;
   for (const g of mergePlan.groups) {
+    // 每组的 src 已经固定，只需组内排序；失效条目仍旧单独成批
     const batches = [
-      ...chunk(g.live, chunkSize).map((part) => ({ part, dead: false })),
-      ...chunk(g.dead, chunkSize).map((part) => ({ part, dead: true })),
+      ...chunk(orderItems(g.live, order), chunkSize).map((part) => ({ part, dead: false })),
+      ...chunk(orderItems(g.dead, order), chunkSize).map((part) => ({ part, dead: true })),
     ];
     for (const { part, dead } of batches) {
       ops.push({

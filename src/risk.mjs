@@ -33,10 +33,13 @@ const TAU = HALF_LIFE_MIN / Math.LN2;   // 指数衰减时间常数（分钟）
 /** 不同写操作对账号热度的权重 */
 const OP_WEIGHT = {
   unfollow: 1.0,
+  follow: 1.4,      // 关注比取关更敏感：批量关注是典型的养号行为特征
+  quietFollow: 1.4,
   favMove: 0.8,
   favDeal: 0.8,
   folderAdd: 2.5,   // 建收藏夹最敏感，连续建极易触发
   tagAdd: 1.0,
+  tagEdit: 1.2,     // 建/改/删分组是账号结构变更，比往分组里塞人重
   read: 0.05,
 };
 
