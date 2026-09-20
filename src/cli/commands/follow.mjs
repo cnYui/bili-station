@@ -3,7 +3,7 @@ import { defineCommand } from '../registry.mjs';
 import { loadFollowData, stateOf, resolveTag, tagsOf } from '../followdata.mjs';
 import { buildSelection, writeSelection, applySelection } from '../selector.mjs';
 import { loadProbes } from '../context.mjs';
-import { RELATION_ACT, SPECIAL_TAG_ID } from '../../bili.mjs';
+import { RELATION_ACT, SPECIAL_TAG_ID, DEFAULT_TAG_ID } from '../../bili.mjs';
 import { buildRelationOps, buildUserTagOps, buildTagAdminOps } from '../../executor.mjs';
 
 const STATE_ACT = {
@@ -156,9 +156,9 @@ export default defineCommand({
       const state = flags.state ?? (sub === 'add' ? 'normal' : null);
       if (!state && !flags.tag) return ctx.usageError('follow set 需要 --state 或 --tag');
 
-      const gate = checkSupport(state);
+      const gate = checkSupport(state, { specialCount: d.special.size });
       if (gate.block) return ctx.usageError(gate.message);
-      if (gate.warn) warnings.push({ code: 'UNVERIFIED', message: gate.message });
+      if (gate.warn) warnings.push({ code: 'QUOTA_OR_UNVERIFIED', message: gate.message });
 
       const ops = [];
       const targets = explicit.map((m) => byMid.get(m) ?? { mid: m, uname: m });
@@ -196,6 +196,12 @@ export default defineCommand({
         const before = u ? tagsOf(u, d.special) : [];
         return JSON.stringify([...before].sort()) !== JSON.stringify([...want].sort());
       }));
+      const badIds = validateTagIds(changed, d.tagById);
+      if (badIds.length) {
+        return ctx.usageError(`目标分组里有不存在的 tagid：${badIds.join(', ')}。`
+          + 'B 站对不存在的 tagid 返回 code 0（静默接受），而分组设置是覆盖语义 —— '
+          + '发出去会把这些人的分组清空。已拦下。');
+      }
       if (changed.size) {
         ops.push(...buildUserTagOps(ctx.bili, changed, { labelOf: (t) => d.tagById.get(t)?.name ?? String(t) }));
       }
@@ -253,31 +259,62 @@ export default defineCommand({
  * 不靠猜：probes.json 里没有记录就只警告不拦（让用户自己去跑探针），
  * 有记录且明确不可用就直接拦下并说明原因 —— 静默失败比报错难查得多。
  */
-function checkSupport(state) {
+function checkSupport(state, { specialCount = null } = {}) {
   const p = loadProbes()['relation-act'];
+  const codeOf = (k) => p?.raw?.[k]?.code ?? p?.raw?.[k + 'Code'] ?? '?';
+  const msgOf = (k) => p?.raw?.[k]?.message ?? '';
+
   if (!p) {
     return (state === 'quiet' || state === 'special')
       ? { warn: true, message: `「${state}」还没在本账号上实测过。先跑 bili-station probe relation-act --yes，否则可能静默失败。` }
       : {};
   }
+
   if (state === 'quiet' && p.verified?.quietFollow === false) {
     return {
       block: true,
-      message: `悄悄关注实测不可用：/x/relation/modify act=3 返回 code=${p.raw?.quietFollowCode}（请求错误）。`
+      message: `悄悄关注实测不可用：/x/relation/modify act=3 返回 code=${codeOf('quietFollow')}「${msgOf('quietFollow')}」。`
         + 'B 站可能已下线这个动作，或它需要额外参数。'
         + `实测时间 ${p.at}，重测：bili-station probe relation-act --yes`,
     };
   }
-  if (state === 'special' && p.verified?.specialWritableViaTags === false) {
-    return {
-      block: true,
-      message: `特别关注无法通过分组接口设置：setUserTags(tagid=-10) 返回 code=${p.raw?.setSpecialCode}。`
-        + '注意「特别关注」在 /x/relation/tags 里是可以读出来的（tagid=-10），但**只读不可写**。'
-        + '目前只能到 B 站网页端手动设置。'
-        + `实测时间 ${p.at}`,
-    };
+
+  if (state === 'special') {
+    // 22117 的 message 是「特殊关注达到上限」——这是**配额**，不是接口不可写。
+    // 所以不拦，只做预检提醒：名额腾出来之后同一条命令就能跑通。
+    if (p.verified?.specialWritableViaTags === false) {
+      return {
+        block: true,
+        message: `特别关注写不进去：setUserTags(tagid=-10) 返回 code=${codeOf('setSpecial')}「${msgOf('setSpecial')}」，原因待查。实测时间 ${p.at}`,
+      };
+    }
+    if (p.specialQuotaFull && specialCount != null) {
+      return {
+        warn: true,
+        message: `特别关注上次实测已达上限（${p.specialCount} 个，B 站返回「${msgOf('setSpecial') || '特殊关注达到上限'}」）。`
+          + `当前 ${specialCount} 个。如果仍然满着，这次写入会失败 —— 先在网页端移除几个再来。`,
+      };
+    }
   }
   return {};
+}
+
+/**
+ * 校验目标分组 id 全部存在。
+ *
+ * 必须做，因为**B 站对不存在的 tagid 返回 code 0「OK」**（实测 tagids=999999999）。
+ * 而 setUserTags 是覆盖语义 —— 传一个错 id 进去不会报错，只会把这个人
+ * 原有的分组静默清空。这是最难查的一类失败。
+ */
+function validateTagIds(desired, tagById) {
+  const bad = new Set();
+  for (const ids of desired.values()) {
+    for (const id of ids) {
+      if (Number(id) === DEFAULT_TAG_ID || Number(id) === SPECIAL_TAG_ID) continue;
+      if (!tagById.has(Number(id))) bad.add(Number(id));
+    }
+  }
+  return [...bad];
 }
 
 function filterUsers(d, flags) {
@@ -370,6 +407,9 @@ async function planTag(ctx, rest) {
       else cur.delete(Number(tagRef.tagid));
       desired.set(m, [...cur]);
     }
+    const badIds = validateTagIds(desired, d.tagById);
+    if (badIds.length) return ctx.usageError(`目标分组里有不存在的 tagid：${badIds.join(', ')}，已拦下（B 站不会报错，会静默清空分组）。`);
+
     return {
       data: {
         action: 'tag-' + op, tag: tagRef.name, count: mids.length,

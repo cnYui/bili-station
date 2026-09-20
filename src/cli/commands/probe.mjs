@@ -194,6 +194,20 @@ function classifyActCode(code, message) {
 }
 
 /**
+ * 记录一次调用的**完整**返回，code 和 message 都要。
+ *
+ * 教训：第一版只记了 `setSpecialCode: 22117`，没记 message。结果面对一个
+ * 光秃秃的数字只能猜，还猜错了方向（判成「接口不可写」），白绕一圈。
+ * message 里写的是「特殊关注达到上限」—— B 站早就把答案直接给了。
+ *
+ * 探针的价值在于把猜测换成证据，那就别在记录环节把证据丢掉。
+ */
+const rec = (raw, key, r) => {
+  raw[key] = { code: r?.code ?? null, message: r?.message ?? null };
+  return r;
+};
+
+/**
  * 关系接口探针。
  *
  * 要回答的问题：
@@ -281,28 +295,51 @@ async function relationActProbe(ctx) {
 
         // ---- Q3：特别关注能不能通过分组接口写 ----
         await sleep(2000);
-        const rSpecial = await bili.setUserTags([mid], [...beforeTags, SPECIAL_TAG_ID]);
-        result.raw.setSpecialCode = rSpecial?.code ?? null;
+        const rSpecial = rec(result.raw, 'setSpecial', await bili.setUserTags([mid], [...beforeTags, SPECIAL_TAG_ID]));
         await sleep(2000);
+        const specialCount = (await bili.specialFollowings()).size;
         const nowSpecial = (await bili.specialFollowings()).has(mid);
-        result.verified.specialWritableViaTags = nowSpecial;
-        ctx.say(nowSpecial
-          ? '  ✓ Q3：可以通过 tagid=-10 写入特别关注'
-          : `  ✗ Q3：tagid=-10 只能读不能写（code=${rSpecial?.code}）—— 特别关注的设置要另找接口`);
+        result.specialCount = specialCount;
+
         if (nowSpecial) {
+          result.verified.specialWritableViaTags = true;
+          result.specialQuotaFull = false;
+          ctx.say('  ✓ Q3：可以通过 tagid=-10 写入特别关注');
           await sleep(2000);
           await bili.setUserTags([mid], beforeTags);   // 立刻恢复
           ctx.say('  已把样本移出特别关注，恢复原状');
+        } else if (rSpecial?.code === 22117) {
+          // 22117 的 message 是「特殊关注达到上限」—— 这是配额，不是接口限制。
+          // 和 22014 同理：收到业务规则拒绝，恰恰说明写入路径是通的。
+          result.verified.specialWritableViaTags = true;
+          result.specialQuotaFull = true;
+          ctx.say(`  ⚠ Q3：写入路径可用，但特别关注已满（${specialCount} 个，code=22117「${rSpecial?.message}」）`);
+          ctx.say('     腾出名额后 tagid=-10 就能写。这是配额问题，不是接口不支持。');
+        } else {
+          result.verified.specialWritableViaTags = false;
+          result.specialQuotaFull = null;
+          ctx.say(`  ✗ Q3：tagid=-10 写不进去（code=${rSpecial?.code}「${rSpecial?.message}」），原因待查`);
         }
+
+        // ---- Q4：不存在的 tagid 会不会被静默接受 ----
+        // 实测 tagids=999999999 返回 code 0 "OK"。这意味着传错 id **不报错**，
+        // 而 setUserTags 是覆盖语义 —— 上层必须自己校验 tagid，否则会静默清空分组。
+        await sleep(2500);
+        const rBogus = rec(result.raw, 'bogusTagid', await bili.setUserTags([mid], [999999999]));
+        result.verified.bogusTagidRejected = rBogus?.code !== 0;
+        ctx.say(result.verified.bogusTagidRejected
+          ? `  ✓ Q4：不存在的 tagid 被拒绝（code=${rBogus?.code}）`
+          : '  ⚠ Q4：不存在的 tagid 返回 code=0（静默接受）→ 上层必须自己校验 tagid');
+        await sleep(2000);
+        await bili.setUserTags([mid], beforeTags);   // 恢复原分组
 
         // ---- Q1：act 取值 ----
         for (const [name, act] of [['follow', RELATION_ACT.follow], ['quietFollow', RELATION_ACT.quietFollow]]) {
           await sleep(2500);
-          const r = await bili.modifyRelation(subject.mid, act);
+          const r = rec(result.raw, name, await bili.modifyRelation(subject.mid, act));
           const c = classifyActCode(r?.code, r?.message);
           result.verified[name] = c.supported;
-          result.raw[name + 'Code'] = r?.code ?? null;
-          ctx.say(`  act=${act}（${name}）→ code=${r?.code}：${c.note}`);
+          ctx.say(`  act=${act}（${name}）→ code=${r?.code}「${r?.message ?? ''}」：${c.note}`);
         }
         result.verified.unfollow = true;   // act=2 是项目里早就实测过的
 
@@ -320,7 +357,10 @@ async function relationActProbe(ctx) {
         const unknown = Object.entries(result.verified).filter(([, v]) => v === null).map(([k]) => k);
         result.summary = [
           `setUserTags 覆盖语义：${fmt(result.verified.setUserTagsIsReplace)}`,
-          `特别关注可通过分组接口写入：${fmt(result.verified.specialWritableViaTags)}`,
+          `特别关注可通过 tagid=-10 写入：${fmt(result.verified.specialWritableViaTags)}`
+            + (result.specialQuotaFull ? `（但已达上限 ${result.specialCount} 个，需先腾名额）` : ''),
+          `不存在的 tagid 会被拒绝：${fmt(result.verified.bogusTagidRejected)}`
+            + (result.verified.bogusTagidRejected === false ? '（危险：上层必须自己校验）' : ''),
           `可用：${usable.join(', ') || '无'}`,
           `不可用：${unusable.join(', ') || '无'}`,
           ...(unknown.length ? [`结论无效（需重跑）：${unknown.join(', ')}`] : []),
