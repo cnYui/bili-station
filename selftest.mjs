@@ -46,9 +46,14 @@ const mkUsers = (n, t0 = 1_700_000_000) =>
     ['1002', { lastPubTs: null, count: 0 }],                   // 零投稿
   ]);
   const p = planUnfollow(all, { onlyInactive: true, inactiveDays: 180, inactive });
-  eq('只取关停更号：命中 2 个', p.targets.length, 2);
+  eq('只取关停更号：命中 1 个（零投稿号默认不算）', p.targets.length, 1);
   ok('活跃号被保留', !p.targets.some((u) => u.mid === '1001'));
-  ok('零投稿号被判为停更', p.targets.some((u) => u.mid === '1002'));
+  ok('零投稿号默认不判停更（count=0 含义不明确，实测过对活跃大号也会返回 0）',
+    !p.targets.some((u) => u.mid === '1002'));
+  {
+    const p2 = planUnfollow(all, { onlyInactive: true, inactiveDays: 180, inactive, zeroUploadIsStale: true });
+    ok('显式 opt-in 后零投稿号才算停更', p2.targets.some((u) => u.mid === '1002'));
+  }
 }
 {
   const all = mkUsers(6);

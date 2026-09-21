@@ -14,6 +14,11 @@ export default defineCommand({
     keep: { type: 'int', min: 0, desc: '保留最近关注的前 N 个' },
     'inactive-days': { type: 'int', min: 1, desc: '超过 N 天没投稿算停更。需要先跑 scan uploads' },
     'only-inactive': { type: 'boolean', desc: '只取关停更号' },
+    'include-zero-upload': {
+      type: 'boolean',
+      desc: '把「投稿数为 0」也算作停更。默认不算 —— 实测 arc/search 会对确实在更新的'
+        + '大号返回 code 0 + count 0（空间隐私 / 账号迁移 / 限流期间的空响应），会误取关',
+    },
     'protect-tag': { type: 'csv', desc: '这些分组里的 UP 无条件保留（分组名或 tagid）' },
     refresh: { type: 'boolean', desc: '强制重新拉取关注列表' },
   },
@@ -47,7 +52,19 @@ export default defineCommand({
       inactiveDays: flags['inactive-days'] ?? null,
       inactive: d.uploads,
       onlyInactive: !!flags['only-inactive'],
+      zeroUploadIsStale: !!flags['include-zero-upload'],
     });
+
+    // 零投稿的单独点出来：它们不在目标里，但用户多半想知道有这么一批
+    const zeroUpload = [...d.uploads].filter(([, v]) => v?.ok !== false && (v.count ?? 0) === 0).map(([mid]) => mid);
+    if (zeroUpload.length && !flags['include-zero-upload']) {
+      warnings.push({
+        code: 'ZERO_UPLOAD_SKIPPED',
+        message: `另有 ${zeroUpload.length} 个 UP 查到的投稿数是 0，默认不当作停更 —— `
+          + 'count=0 可能是空间隐私、账号迁移，也可能是限流期间接口返回了空数据。'
+          + '确认过再用 --include-zero-upload 纳入。',
+      });
+    }
 
     if (!p.targets.length) {
       return {
@@ -62,6 +79,8 @@ export default defineCommand({
     return {
       data: {
         total: p.total, willUnfollow: p.targets.length, kept: p.keptCount,
+        zeroUploadSkipped: flags['include-zero-upload'] ? 0 : zeroUpload.length,
+        withUploadData: [...d.uploads.values()].filter((v) => v?.ok !== false).length,
         protectedByTag: protectTags.size, specialKept: d.special.size,
         byReason: p.summary.byReason, truncated: d.truncated,
         targets: p.targets.slice(0, 50).map((u) => ({ mid: u.mid, uname: u.uname, reason: p.reasons.get(String(u.mid)) })),
