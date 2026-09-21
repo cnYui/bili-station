@@ -3,7 +3,8 @@ import { join } from 'node:path';
 import { defineCommand } from '../registry.mjs';
 import { store } from '../context.mjs';
 import { loadCache, saveCache, itemsOf, scanMany } from '../favcache.mjs';
-import { sleep } from '../../risk.mjs';
+import { sleep, RiskEngine, RISK_CODES, AUTH_CODES } from '../../risk.mjs';
+import { EXIT } from '../output.mjs';
 
 export default defineCommand({
   name: 'scan',
@@ -24,9 +25,10 @@ export default defineCommand({
     out: { type: 'path', desc: 'sample：样本输出路径' },
     limit: { type: 'int', min: 1, desc: 'uploads：只查前 N 个（按最近关注排序）' },
     delay: {
-      type: 'int', min: 300, max: 5000, default: 700,
+      type: 'int', min: 300, max: 10000, default: 1200,
       desc: 'uploads：每次请求之间的基础间隔 ms（实际会再加 0~600ms 抖动）。'
-        + '投稿查询是只读操作（风控权重 0.05），450~700 是本项目读操作的既有节奏',
+        + '实测 500ms 跑到第 ~150 个就会撞 -412 墙，所以默认给到 1200。'
+        + '真正的保护是连续失败熔断，不是这个数字',
     },
     videos: {
       type: 'int', min: 0, max: 50, default: 5,
@@ -89,6 +91,13 @@ export default defineCommand({
         store.write('followings.json', data);
       }
       const known = new Map(store.read('uploads.json', []));
+      // 风控码留下的记录是「没读到」，不是「这个 UP 没有视频」—— 直接清掉重查，
+      // 否则它们会一直以 {ok:false} 的形式赖在文件里冒充数据
+      let purged = 0;
+      for (const [k, v] of known) {
+        if (v?.ok === false && RISK_CODES.has(v.code)) { known.delete(k); purged++; }
+      }
+      if (purged) ctx.say(`清掉 ${purged} 条被风控污染的记录（-412/-352 是没读到，不是没视频）`);
       const nVideos = ctx.flags.videos;
       let list = data.list;
       if (ctx.flags.limit) list = list.slice(0, ctx.flags.limit);
@@ -106,34 +115,95 @@ export default defineCommand({
         ctx.say(`预计约 ${Math.ceil(todo.length * perReq / 60)} 分钟。这是只读操作，中断了重跑会接着查。`);
       }
 
-      let done = 0, failed = 0;
+      // 读操作也必须受风控约束。第一版这个循环既不退避也不熔断，撞墙后
+      // 又硬撞了 80 分钟 / 4830 次（-412 占 3900 个），而热度表因为没记录
+      // 还一直报 green。三个洞一起补上。
+      const risk = new RiskEngine(ctx.cfg.risk, store.read('risk-history.json', null));
+      const MAX_CONSECUTIVE = 5;   // 连续这么多个都撞风控码就认定「墙立起来了」
+      const RETRY = 2;
+      let done = 0, failed = 0, riskHits = 0, consecutive = 0, added = 0;
+      let stopped = null;
+
+      const fetchOne = async (mid) => (nVideos === 0
+        ? ctx.bili.lastUpload(mid)
+        : ctx.bili.spaceVideos(mid, { ps: nVideos }));
+
       for (const u of todo) {
-        try {
-          const r = nVideos === 0
-            ? await ctx.bili.lastUpload(u.mid)
-            : await ctx.bili.spaceVideos(u.mid, { ps: nVideos });
-          // 统一成 planUnfollow 认的形状：{count, lastPubTs}，外加可选的 videos
+        if (stopped) break;
+        let r = null;
+        for (let attempt = 1; attempt <= RETRY + 1; attempt++) {
+          try { r = await fetchOne(u.mid); } catch (e) { r = { ok: false, code: -1, message: e.message }; }
+          if (r.ok !== false || !RISK_CODES.has(r.code)) break;
+          riskHits++;
+          if (attempt > RETRY) break;
+          // 和 favItems 同一套退避：撞一次就放弃会把「读不到」伪装成「没有」
+          const wait = 15_000 * attempt;
+          ctx.say(`  ⏸ 被限流（code=${r.code}），退避 ${wait / 1000}s 后重试（第 ${attempt} 次）`);
+          await sleep(wait);
+        }
+
+        if (r.ok === false && AUTH_CODES.has(r.code)) {
+          stopped = { reason: 'auth', code: r.code };
+          break;
+        }
+        if (r.ok === false && RISK_CODES.has(r.code)) {
+          consecutive++;
+          failed++;
+          // 撞墙即停，和执行器的 stopOnRisk 同一个道理：退避过还是撞，
+          // 说明不是抖动而是墙。继续撞只会让墙更高。
+          if (consecutive >= MAX_CONSECUTIVE) { stopped = { reason: 'risk', code: r.code }; }
+        } else {
+          consecutive = 0;
+          if (r.ok === false) failed++;
+          else risk.record('read', 1);
           known.set(String(u.mid), r.ok === false ? { ok: false, code: r.code } : {
             ok: true,
             count: r.count ?? 0,
             lastPubTs: r.lastPubTs ?? r.videos?.[0]?.created ?? null,
             ...(r.videos ? { videos: r.videos } : {}),
           });
-          if (r.ok === false) failed++;
-        } catch { failed++; }
+          if (r.ok !== false) added++;
+        }
+
         done++;
         if (done % 25 === 0) {
           store.write('uploads.json', [...known]);   // 边查边存，中断也不白跑
-          ctx.say(`  ${done}/${todo.length}${failed ? `（失败 ${failed}）` : ''}`);
+          store.write('risk-history.json', risk.toJSON());
+          ctx.say(`  ${done}/${todo.length}${failed ? `（失败 ${failed}）` : ''}  热度 ${risk.status().heat}/100`);
         }
-        // 投稿查询走 wbi 签名接口，权重低但仍是读操作，保持节奏
-        if (done < todo.length) await sleep(ctx.flags.delay + Math.random() * 600);
+        if (!stopped && done < todo.length) await sleep(ctx.flags.delay + Math.random() * 600);
       }
+
       store.write('uploads.json', [...known]);
+      store.write('risk-history.json', risk.toJSON());
       const withVideos = [...known.values()].filter((x) => x.videos?.length).length;
+      const okCount = [...known.values()].filter((x) => x.ok !== false).length;
+
+      const warnings = [];
+      if (stopped?.reason === 'risk') {
+        warnings.push({
+          code: 'RISK_WALL',
+          message: `连续 ${MAX_CONSECUTIVE} 个 UP 都撞上风控码（最后一个 code=${stopped.code}），已中止本轮。`
+            + `本次新增 ${added} 条，进度已保存，重跑会从没查到的接着查。`
+            + '建议等 1 小时以上，并把 --delay 调大（比如 2000）再来。',
+        });
+      }
+      if (stopped?.reason === 'auth') {
+        warnings.push({ code: 'AUTH', message: `登录态失效（code=${stopped.code}），请在 Chrome 里重新登录 B 站。` });
+      }
+      if (failed && !stopped) {
+        warnings.push({ code: 'PARTIAL', message: `${failed} 个 UP 没查到（私密空间 / 已注销），重跑会再试一次` });
+      }
+
       return {
-        data: { checked: done, failed, cached: known.size, withVideos, videosPerUp: nVideos, followings: data.list.length },
-        warnings: failed ? [{ code: 'PARTIAL', message: `${failed} 个 UP 的投稿信息没查到（私密空间 / 限流），重跑会补` }] : [],
+        data: {
+          checked: done, added, failed, riskHits, cached: known.size, ok: okCount,
+          withVideos, videosPerUp: nVideos, followings: data.list.length,
+          heat: risk.status().heat, stopped: stopped?.reason ?? null,
+          remaining: todo.length - done,
+        },
+        warnings,
+        exit: stopped?.reason === 'risk' ? EXIT.RISK : stopped?.reason === 'auth' ? EXIT.AUTH : EXIT.OK,
       };
     }
 
