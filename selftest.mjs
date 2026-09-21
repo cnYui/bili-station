@@ -242,6 +242,27 @@ section('风控引擎');
   eq('超过 24h 的事件不计入热度', r.status(now).heat, 0);
 }
 {
+  // 读写预算分离：一次 4000 次的只读扫描不该把写操作的热度顶到 red
+  const { RiskEngine, READ_SAFE_PER_MIN } = await import('./src/risk.mjs');
+  const r = new RiskEngine();
+  for (let i = 0; i < 4000; i++) r.record('read', 1);
+  const s = r.status();
+  eq('大量读操作不推高热度', s.heat, 0);
+  eq('读级别仍是 green', s.level, 'green');
+  ok('但读速率被单独观测到', s.readPerMin > 0);
+  ok('并被标记为超速', s.readTooFast === true);
+
+  const r2 = new RiskEngine();
+  for (let i = 0; i < 30; i++) r2.record('unfollow', 1);
+  ok('写操作照常推高热度', r2.status().heat > 0);
+  eq('写操作不污染读速率', r2.status().readPerMin, 0);
+
+  const r3 = new RiskEngine();
+  for (let i = 0; i < 100; i++) r3.record('read', 1);   // 100 次 / 5 分钟窗口 = 20 次/分
+  ok('低速读不报超速', r3.status().readTooFast === false);
+  ok('实测安全上限有明确取值', READ_SAFE_PER_MIN >= 40 && READ_SAFE_PER_MIN <= 60);
+}
+{
   const r = new RiskEngine();
   eq('零事件时为 green', r.status().level, 'green');
   eq('green 无附加静默', r.levelPauseMs('green'), 0);

@@ -40,8 +40,27 @@ const OP_WEIGHT = {
   folderAdd: 2.5,   // 建收藏夹最敏感，连续建极易触发
   tagAdd: 1.0,
   tagEdit: 1.2,     // 建/改/删分组是账号结构变更，比往分组里塞人重
-  read: 0.05,
 };
+
+/**
+ * 读操作**不计入热度**，单独按速率管。
+ *
+ * 这是实测逼出来的分离。读和写是两套完全不同的预算：
+ *   · 读：50 次/分连跑 60 次零失败，65.5 次/分开始撞 -412，约 16 分钟自动解除
+ *   · 写：同一天里以 20 次/分连做 66 次取关，风控码 0
+ * 把两者加进同一个 0–100 的表里，一次 4000 次的只读扫描就能把热度顶到 100，
+ * 让紧接着的写操作被毫无道理地拖慢 —— 这正是「先验不该当门槛」那条教训的翻版，
+ * 而且这里的先验还是把两种不同的量硬加在一起。
+ *
+ * 所以：热度只反映写操作；读用 readPerMin 单独观测，阈值来自实测。
+ */
+export const READ_OPS = new Set(['read']);
+
+/** 实测安全读速率上限（次/分）。65.5 次/分会撞墙，这里留了余量。 */
+export const READ_SAFE_PER_MIN = 50;
+
+/** 读速率的观测窗口（分钟） */
+const READ_WINDOW_MIN = 5;
 
 export class RiskEngine {
   /** @param {object} persisted 之前存下来的 { events: [{t, op, n}] } */
@@ -65,20 +84,30 @@ export class RiskEngine {
   /** 0–100 的账号写操作热度 + green/yellow/orange/red 分级 */
   status(now = Date.now()) {
     let heat = 0;
+    let readsInWindow = 0;
     const totals = {};
     for (const e of this.events) {
       const dtMin = (now - e.t) / 60_000;
       if (dtMin < 0 || dtMin > 24 * 60) continue;
+      totals[e.op] = (totals[e.op] ?? 0) + e.n;
+      if (READ_OPS.has(e.op)) {
+        // 读不进热度，只统计最近窗口内的速率
+        if (dtMin <= READ_WINDOW_MIN) readsInWindow += e.n;
+        continue;
+      }
       const w = OP_WEIGHT[e.op] ?? 1;
       heat += w * Math.exp(-dtMin / TAU) * e.n;
-      totals[e.op] = (totals[e.op] ?? 0) + e.n;
     }
     heat = Math.min(100, heat);
+    const readPerMin = readsInWindow / READ_WINDOW_MIN;
     const level = heat < 30 ? 'green' : heat < 60 ? 'yellow' : heat < 80 ? 'orange' : 'red';
     const lastRisk = this.events.filter((e) => e.op === '_risk').at(-1);
     return {
       heat: Math.round(heat),
       level,
+      readPerMin: Math.round(readPerMin * 10) / 10,
+      readSafeMax: READ_SAFE_PER_MIN,
+      readTooFast: readPerMin > READ_SAFE_PER_MIN,
       totals24h: totals,
       lastRiskAgeMin: lastRisk ? Math.round((now - lastRisk.t) / 60_000) : null,
       curDelayMs: Math.round(this.curDelay),
