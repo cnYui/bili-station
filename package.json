@@ -10,9 +10,11 @@
   "scripts": {
     "start": "node server.mjs",
     "chrome": "node scripts/launch-chrome.mjs",
-    "test": "node selftest.mjs",
-    "cli": "node cli.mjs",
-    "test:e2e": "node test-sort-flow.mjs"
+    "test": "node selftest.mjs && node test-cli.mjs && node test-sort-flow.mjs",
+    "test:unit": "node selftest.mjs",
+    "test:cli": "node test-cli.mjs",
+    "test:e2e": "node test-sort-flow.mjs",
+    "cli": "node cli.mjs"
   },
   "bin": {
     "bili-station": "./cli.mjs"

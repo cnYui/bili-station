@@ -46,9 +46,14 @@ const mkUsers = (n, t0 = 1_700_000_000) =>
     ['1002', { lastPubTs: null, count: 0 }],                   // 零投稿
   ]);
   const p = planUnfollow(all, { onlyInactive: true, inactiveDays: 180, inactive });
-  eq('只取关停更号：命中 2 个', p.targets.length, 2);
+  eq('只取关停更号：命中 1 个（零投稿号默认不算）', p.targets.length, 1);
   ok('活跃号被保留', !p.targets.some((u) => u.mid === '1001'));
-  ok('零投稿号被判为停更', p.targets.some((u) => u.mid === '1002'));
+  ok('零投稿号默认不判停更（count=0 含义不明确，实测过对活跃大号也会返回 0）',
+    !p.targets.some((u) => u.mid === '1002'));
+  {
+    const p2 = planUnfollow(all, { onlyInactive: true, inactiveDays: 180, inactive, zeroUploadIsStale: true });
+    ok('显式 opt-in 后零投稿号才算停更', p2.targets.some((u) => u.mid === '1002'));
+  }
 }
 {
   const all = mkUsers(6);
@@ -235,6 +240,27 @@ section('风控引擎');
   const now = Date.now();
   r.events = [{ t: now - 25 * 3600_000, op: 'unfollow', n: 999 }];
   eq('超过 24h 的事件不计入热度', r.status(now).heat, 0);
+}
+{
+  // 读写预算分离：一次 4000 次的只读扫描不该把写操作的热度顶到 red
+  const { RiskEngine, READ_SAFE_PER_MIN } = await import('./src/risk.mjs');
+  const r = new RiskEngine();
+  for (let i = 0; i < 4000; i++) r.record('read', 1);
+  const s = r.status();
+  eq('大量读操作不推高热度', s.heat, 0);
+  eq('读级别仍是 green', s.level, 'green');
+  ok('但读速率被单独观测到', s.readPerMin > 0);
+  ok('并被标记为超速', s.readTooFast === true);
+
+  const r2 = new RiskEngine();
+  for (let i = 0; i < 30; i++) r2.record('unfollow', 1);
+  ok('写操作照常推高热度', r2.status().heat > 0);
+  eq('写操作不污染读速率', r2.status().readPerMin, 0);
+
+  const r3 = new RiskEngine();
+  for (let i = 0; i < 100; i++) r3.record('read', 1);   // 100 次 / 5 分钟窗口 = 20 次/分
+  ok('低速读不报超速', r3.status().readTooFast === false);
+  ok('实测安全上限有明确取值', READ_SAFE_PER_MIN >= 40 && READ_SAFE_PER_MIN <= 60);
 }
 {
   const r = new RiskEngine();

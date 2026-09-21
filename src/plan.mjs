@@ -21,6 +21,13 @@ export function planUnfollow(all, o = {}) {
   const inactive = o.inactive ?? new Map();
   const inactiveDays = o.inactiveDays ?? null;
   const onlyInactive = o.onlyInactive ?? false;
+  // 「零投稿」默认不算停更。实测发现 /x/space/wbi/arc/search 会对确实在更新的
+  // 大号返回 code 0 + count 0（空间隐私 / 账号迁移 / 限流期间的空响应都可能），
+  // 把它当成「一个投稿都没有」会误取关。要动这批必须显式 opt-in。
+  const zeroUploadIsStale = o.zeroUploadIsStale ?? false;
+  // 特别关注默认无条件保留。要动必须显式传 true —— 它比普通关注是更强的
+  // 意图信号（用户特意标过），绝不能因为「规则命中了」就顺手带走。
+  const includeSpecial = o.includeSpecial ?? false;
 
   const nowSec = Math.floor(Date.now() / 1000);
   const sorted = [...all].sort((a, b) => (b.mtime ?? 0) - (a.mtime ?? 0));
@@ -32,7 +39,7 @@ export function planUnfollow(all, o = {}) {
     if (inactiveDays == null) return false;
     const info = inactive.get(String(u.mid));
     if (!info) return false;
-    if (info.count === 0) return true; // 一个投稿都没有
+    if (info.count === 0) return zeroUploadIsStale; // 零投稿：含义不明确，默认不判停更
     if (!info.lastPubTs) return false;
     return (nowSec - info.lastPubTs) / 86400 > inactiveDays;
   };
@@ -42,9 +49,10 @@ export function planUnfollow(all, o = {}) {
 
   sorted.forEach((u, idx) => {
     const mid = String(u.mid);
-    if (protectedSet.has(mid) || u.special) {
+    const isSpecial = special.has(mid) || u.special;
+    if ((isSpecial && !includeSpecial) || protectTags.has(mid)) {
       kept.push(u);
-      reasons.set(mid, special.has(mid) || u.special ? 'special' : 'protected-tag');
+      reasons.set(mid, isSpecial ? 'special' : 'protected-tag');
       return;
     }
     if (onlyInactive) {

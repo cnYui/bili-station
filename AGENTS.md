@@ -11,7 +11,9 @@
 3. **先小批量试。** 第一次带 `--yes` 时加 `--limit 30`，让用户看过结果再放开。
 4. **退出码 2（风控中止）时停手。** 不要重试、不要换参数再冲。告诉用户等一段时间（建议 1 小时以上）再继续。
 5. **退出码 3（登录失效）时停手。** 让用户去 Chrome 里重新登录，不要尝试任何绕过。
-6. 所有命令加 `--json`，stdout 会是单个 JSON 对象，stderr 是进度日志。
+6. **退出码 5（参数错误）是可以自己修的。** 错误信息会告诉你哪个参数错了、合法值是什么，
+   拼错的 flag 还会给出最接近的候选名。改对了重跑即可，不用问用户。
+7. 所有命令加 `--json`，stdout 会是单个 JSON 信封，stderr 是进度日志。
 
 ## 前置条件
 
@@ -21,6 +23,26 @@ bili-station status --json
 ```
 
 `status` 返回 `loggedIn: false` 就别往下走，先让用户完成上面两步。
+
+## 能力发现
+
+不用读这一页也能知道有什么命令、每个参数什么类型：
+
+```bash
+bili-station schema --json        # 全部命令 / 参数类型 / 枚举值 / 必填项 / 退出码语义
+bili-station <命令> --help        # 单个命令的用法
+```
+
+## JSON 信封
+
+所有命令同形，**业务数据在 `data` 下**：
+
+```json
+{ "ok": true, "v": 1, "command": "sort", "dryRun": true, "exit": 0,
+  "data": { ... }, "warnings": [{ "code": "...", "message": "..." }], "error": null }
+```
+
+老脚本按扁平结构解析的，加 `--json-flat` 拿回旧形状。
 
 ## 收藏夹分类的标准流程
 
@@ -76,13 +98,62 @@ bili-station unfollow --only-inactive --inactive-days 365 --json
 注意结果里的 `truncated`：为 true 说明 B 站的分页深度限制导致关注列表**没拉全**，
 这时 `total` 和实际处理数对不上是正常的，要如实告诉用户，别说成「已全部清理」。
 
+## 新夹里的排列顺序
+
+B 站的 move/copy 会把 `fav_time` 重写成操作时间，所以**提交顺序的逆序 = 最终显示顺序**
+（`probe fav-order` 实测确认）。默认 `--order original` 让新夹里「最近收藏的排最上面」，
+和原来一致。用户说「顺序不对 / 最新的跑到最底下了」时，多半是在用旧数据或 `--order as-scanned`。
+
+排序精度只到一批（默认 20 条）。用户要求逐条精确时才用 `--chunk-size 1`，
+**先把调用次数上涨 20 倍这件事告诉他**。
+
+## 关注管理
+
+```bash
+bili-station follow list --tag 编程 --json
+bili-station follow list --state special --json
+bili-station follow tag create "长期追更" --yes --json
+bili-station scan uploads --videos 5 --json   # 投稿时间 + 最近 5 条视频的标题/简介
+```
+
+**先分清确定性和语义。** 「一年没更新」「投稿数为 0」这类有精确判据的，
+用确定性过滤，别交给模型：
+
+```bash
+bili-station unfollow --only-inactive --inactive-days 365 --json
+```
+
+只有「内容转型了」「全是恰饭」「和我关注的方向无关」这类才需要语义裁决：
+
+```bash
+bili-station follow remove --inactive-days 180 --query "<用户原话>" --emit-candidates c.json --json
+# 你读 candidates 里的 recentVideos 判断，写 {"selected":{"<uid>":"<理由>"}}
+bili-station follow remove --apply picked.json --json        # 干跑
+bili-station follow remove --apply picked.json --yes --json  # 执行
+```
+
+**特别关注受配额限制**：22117 的 message 是「特殊关注达到上限」。写入路径是通的，
+只是名额满了——如实告诉用户「先在网页端移除几个特别关注再来」，别说成"接口不支持"。
+
+**悄悄关注目前设不了**（act=3 → -400）。CLI 会直接拦下，别绕过，也别告诉用户"设好了"。
+
+**绝不要手写 tagid**。B 站对不存在的 tagid 返回 code 0（静默接受），
+而分组是覆盖语义——传错会清空那个人的分组。一律用 `follow list` 读出来的真实 tagid。
+
+详见 `docs/context/ai/03-探针实测.md`。
+
 ## 需要如实转述给用户的字段
 
+（都在 `data` 下，除了 `warnings`）
+
 - `warnings[]` —— 配额/容量预警。特别是 `folder-quota`：**配额满时 B 站的报错长得像限流，其实不是**，别误导用户以为是风控。
-- `needReview` —— 置信度偏低、建议人工复核的条数。
-- `truncated` —— 关注列表是否没拉全。
-- `result.riskHits` —— 本轮命中风控几次。不为 0 就要提醒用户放慢。
-- `status` 为 `stopped` —— 是撞风控主动停的，不是跑完了。
+- `data.needReview` —— 置信度偏低、建议人工复核的条数。
+- `data.truncated` —— 关注列表是否没拉全。
+- `data.orderCost` —— `--order-scope global` 会多花多少次调用。
+- `data.result.riskHits` —— 本轮命中风控几次。不为 0 就要提醒用户放慢。
+- `data.status` 为 `stopped` —— 是撞风控主动停的，不是跑完了。
+- `data.rejected` —— 被拒收的条数（分类名不在候选集 / 受保护对象 / 没给理由）。
+  **拒收的那些什么都没做**，别算进成功数。
 
 ## 不要做的事
 

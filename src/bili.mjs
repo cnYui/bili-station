@@ -8,6 +8,30 @@ import { PAGE_FETCH } from './cdp.mjs';
 
 const API = 'https://api.bilibili.com';
 
+/** 特别关注在 B 站内部就是一个分组；默认分组是 0 */
+export const SPECIAL_TAG_ID = -10;
+export const DEFAULT_TAG_ID = 0;
+
+/**
+ * /x/relation/modify 的 act 取值。
+ *
+ * 只有 unfollow(2) 是本项目实测跑过的（4260 条那次实战之外还跑过取关）。
+ * 其余取值来自公开文档，**必须实测确认后再依赖** ——
+ * `bili-station probe relation-act --yes` 会逐个试并把结果写进 probes.json，
+ * 上层命令读它来决定哪些 state 可用。把猜测硬写进代码是这个项目一直避免的事。
+ */
+export const RELATION_ACT = {
+  follow: 1,
+  unfollow: 2,
+  quietFollow: 3,
+  unquietFollow: 4,
+  block: 5,
+  unblock: 6,
+};
+
+/** 关注状态的三个取值，对应用户口中的「普通关注 / 特别关注 / 悄悄关注」 */
+export const FOLLOW_STATES = ['normal', 'special', 'quiet'];
+
 const MIXIN_TAB = [
   46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
   33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61,
@@ -113,10 +137,26 @@ export class Bili {
     return { list: all, total, truncated };
   }
 
+  /**
+   * 特别关注就是 tagid = -10 的分组 —— 这是「特别关注」和「分组」共用同一套
+   * API 的直接证据，所以上层绝不能把它们做成两套命令。默认分组是 tagid = 0。
+   */
   async specialFollowings() {
-    const r = await this.get(API + '/x/relation/tag?tagid=-10&pn=1&ps=100');
-    const list = r?.code === 0 ? (r.data ?? []) : [];
-    return new Set(list.map((u) => String(u.mid)));
+    return new Set((await this.tagUsers(SPECIAL_TAG_ID)).map((u) => String(u.mid)));
+  }
+
+  /** 读一个分组里的成员。tagid=-10 特别关注 / 0 默认分组 */
+  async tagUsers(tagid, { ps = 50, maxPages = 40 } = {}) {
+    const out = [];
+    for (let pn = 1; pn <= maxPages; pn++) {
+      const r = await this.get(API + `/x/relation/tag?tagid=${tagid}&pn=${pn}&ps=${ps}`);
+      if (r?.code !== 0) break;
+      const list = r.data ?? [];
+      out.push(...list);
+      if (list.length < ps) break;
+      await new Promise((res) => setTimeout(res, 250 + Math.random() * 300));
+    }
+    return out;
   }
 
   async tags() {
@@ -124,22 +164,92 @@ export class Bili {
     return r?.code === 0 ? (r.data ?? []) : [];
   }
 
-  unfollow(mid) {
-    return this.post(API + '/x/relation/modify', { fid: String(mid), act: '2', re_src: '11' });
+  /**
+   * 关系修改的唯一入口。act 取值见 RELATION_ACT。
+   * 注意：除了 2（取关）以外的取值都需要实测确认 —— 跑
+   * `bili-station probe relation-act` 会把真实可用的值写进 probes.json。
+   */
+  modifyRelation(mid, act) {
+    return this.post(API + '/x/relation/modify', { fid: String(mid), act: String(act), re_src: '11' });
   }
 
-  addUsersToTag(mids, tagids) {
+  follow(mid) { return this.modifyRelation(mid, RELATION_ACT.follow); }
+  unfollow(mid) { return this.modifyRelation(mid, RELATION_ACT.unfollow); }
+  quietFollow(mid) { return this.modifyRelation(mid, RELATION_ACT.quietFollow); }
+  unquietFollow(mid) { return this.modifyRelation(mid, RELATION_ACT.unquietFollow); }
+
+  /**
+   * 设置一批用户的分组归属。
+   *
+   * 这个接口是**覆盖**语义：传进去的 tagids 就是该用户之后的全部分组。
+   * 所以「移出某个分组」= 传「除它以外的其余分组」，而不是有个 removeUsers 接口。
+   * 特别关注的加/取消同样走这里（tagid -10 在不在列表里）。
+   * 覆盖语义也需要实测确认，见 probe relation-act。
+   */
+  setUserTags(mids, tagids) {
     return this.post(API + '/x/relation/tags/addUsers', {
       fids: mids.join(','),
-      tagids: tagids.join(','),
+      tagids: (tagids.length ? tagids : [0]).join(','),
     });
   }
 
+  /** 保留旧名字，语义等同 setUserTags */
+  addUsersToTag(mids, tagids) { return this.setUserTags(mids, tagids); }
+
+  /**
+   * 新建关注分组。
+   *
+   * 端点是 /x/relation/tag/create —— 重构前写的是 /x/relation/tag/add，**那是 404**
+   * （实测：`{"code":-1,"message":"non-JSON response (HTTP 404)"}`）。
+   * 这条路径此前在 CLI 和 Web UI 都没有入口，所以一直没被发现。
+   *
+   * 分组名不允许包含特殊字符（下划线会被 22101 拒绝），只有中文/字母/数字是安全的。
+   */
   createTag(name) {
-    return this.post(API + '/x/relation/tag/add', { tag: name });
+    return this.post(API + '/x/relation/tag/create', { tag: name });
   }
 
-  /** UP 主最近投稿时间，用于判断停更 / 僵尸号。需 wbi 签名。 */
+  renameTag(tagid, name) {
+    return this.post(API + '/x/relation/tag/update', { tagid: String(tagid), name });
+  }
+
+  deleteTag(tagid) {
+    return this.post(API + '/x/relation/tag/del', { tagid: String(tagid) });
+  }
+
+  /**
+   * UP 主空间的近期投稿。需 wbi 签名。
+   *
+   * 关键性质：**拿 1 条和拿 20 条是同一次请求**，代价只是响应大一点。
+   * 所以判断停更只要时间戳时用 ps=1，要做语义判断（内容转型 / 恰饭 / 方向变了）
+   * 就直接多拿几条标题和简介，不会多花一次调用。
+   *
+   * 真正的成本在 UP 主个数：5000 个关注就是 5000 次请求。
+   *
+   * @returns {{ok, count, videos: Array<{bvid,title,desc,created,play,length,typeid}>}}
+   */
+  async spaceVideos(mid, { ps = 5, introLen = 120 } = {}) {
+    const url = this.signed('/x/space/wbi/arc/search', { mid, ps, pn: 1, order: 'pubdate' });
+    const r = await this.get(url);
+    if (r?.code !== 0) return { ok: false, code: r?.code, message: r?.message };
+    const vlist = r.data?.list?.vlist ?? [];
+    return {
+      ok: true,
+      count: r.data?.page?.count ?? 0,
+      videos: vlist.map((v) => ({
+        bvid: v.bvid,
+        title: v.title,
+        // 简介截断：5000 个 UP × 若干条视频，全文存下来会让 uploads.json 大到难用
+        desc: String(v.description ?? '').replace(/\s+/g, ' ').trim().slice(0, introLen),
+        created: v.created,
+        play: v.play,
+        length: v.length,
+        typeid: v.typeid ?? null,
+      })),
+    };
+  }
+
+  /** 只要「最后投稿时间 + 投稿数」时用这个。planUnfollow 依赖 {count, lastPubTs}。 */
   async lastUpload(mid) {
     const url = this.signed('/x/space/wbi/arc/search', { mid, ps: 1, pn: 1, order: 'pubdate' });
     const r = await this.get(url);
@@ -265,6 +375,11 @@ export class Bili {
       intro,
       privacy: String(privacy),
     });
+  }
+
+  /** 删除收藏夹（夹里的条目会一起没）。不可逆，上层必须先备份。 */
+  deleteFolders(mediaIds) {
+    return this.post(API + '/x/v3/fav/folder/del', { media_ids: mediaIds.join(',') });
   }
 
   /** resources 形如 "aid:type"，type=2 是视频 */
