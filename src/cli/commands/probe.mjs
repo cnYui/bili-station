@@ -1,9 +1,10 @@
 import { defineCommand } from '../registry.mjs';
 import { saveProbe, loadProbes } from '../context.mjs';
 import { RELATION_ACT, SPECIAL_TAG_ID } from '../../bili.mjs';
-import { sleep } from '../../risk.mjs';
+import { sleep, RISK_CODES, AUTH_CODES } from '../../risk.mjs';
 import { toResource } from '../../plan.mjs';
 import * as store from '../../store.mjs';
+import { openLog, readLog, analyze } from '../reqlog.mjs';
 
 /** 关注列表拉一次要两分钟，探针用缓存就够 —— 它只需要一个样本 UP */
 const cachedFollowings = () => {
@@ -16,20 +17,24 @@ const PROBE_FOLDER = '_probe_排序探针';
 export default defineCommand({
   name: 'probe',
   summary: '实测 B 站的真实行为，把结果写进 probes.json 供其他命令读取',
-  usage: '<fav-order|relation-act|list>',
+  usage: '<fav-order|relation-act|rate-limit|list>',
   needsChrome: true,
   mutating: true,
   subs: {
     'fav-order': 'move/copy 是否重写 fav_time、同批条目的内部次序（6 次写操作）',
     'relation-act': '哪些 act 取值可用、setUserTags 是不是覆盖语义（4 次写操作，不改变关注关系）',
+    'rate-limit': '梯度加速逼出 -412 墙，测出限流阈值与恢复时间（只读请求，会故意撞墙）',
     'list': '看已有的探针结果',
   },
   flags: {
     source: { type: 'int', desc: 'fav-order：拿哪个收藏夹的条目做样本；默认挑第一个条目够多的' },
     mid: { type: 'midList', desc: 'relation-act：拿哪个已关注的 UP 做样本；默认挑最近关注的普通关注' },
     keep: { type: 'boolean', desc: 'fav-order：保留探针收藏夹里的条目，不清理' },
+    'max-requests': { type: 'int', min: 20, max: 1000, default: 400, desc: 'rate-limit：请求总数硬上限' },
+    'step-size': { type: 'int', min: 10, max: 200, default: 40, desc: 'rate-limit：每个速率档位跑多少次请求' },
+    'recovery-minutes': { type: 'int', min: 0, max: 180, default: 40, desc: 'rate-limit：撞墙后最多花多少分钟等恢复。0 = 不等' },
   },
-  examples: ['probe list', 'probe fav-order --yes', 'probe relation-act --yes'],
+  examples: ['probe list', 'probe fav-order --yes', 'probe relation-act --yes', 'probe rate-limit --yes'],
 
   async plan(ctx) {
     const what = ctx.positionals[0];
@@ -39,7 +44,8 @@ export default defineCommand({
     }
     if (what === 'fav-order') return favOrderProbe(ctx);
     if (what === 'relation-act') return relationActProbe(ctx);
-    return ctx.usageError(`未知探针：${what}（可用：fav-order / relation-act / list）`);
+    if (what === 'rate-limit') return rateLimitProbe(ctx);
+    return ctx.usageError(`未知探针：${what}（可用：fav-order / relation-act / rate-limit / list）`);
   },
 
   render(r, ctx) {
@@ -375,3 +381,176 @@ async function relationActProbe(ctx) {
 }
 
 const fmt = (v) => (v === true ? '是' : v === false ? '否' : '结论无效');
+
+const RATE_LOG = 'probe-rate-limit.jsonl';
+
+/**
+ * 限流探针：梯度加速逼出 -412 墙，然后测恢复时间。
+ *
+ * ## 为什么值得故意撞墙
+ *
+ * 之前那次失败扫描只留下聚合数字（4980 次里失败 4595），答不出真正要紧的问题：
+ * 失败是在第几次、什么速率下开始的？调慢到底有没有用？墙什么时候撤？
+ * 这些只有带时间戳的逐次记录才能回答。
+ *
+ * ## 两个互斥假设，这个探针就是为了区分它们
+ *
+ *   A 速率上限：单位时间发太多才拦 → 调大间隔就能一直跑
+ *   B 窗口总量：某个时间窗内总共只让发 N 次 → 调慢没用，只是把墙推后
+ *
+ * 梯度设计能同时看到两个维度：每档固定速率跑 step-size 次，跑干净就提速。
+ * 如果是 A，会在某个速率档位上突然失败；如果是 B，会在累计次数接近某个值时失败，
+ * 而与当时处在哪个档位无关。
+ *
+ * ## 和上次失控的区别
+ *
+ * 上次的代价不是「撞了墙」，是**撞墙之后又硬撞了 4830 次、80 分钟**（很可能正是
+ * 登录态被清掉的原因）。这里确认墙立起来之后立刻停，额外请求不超过 CONFIRM 次。
+ *
+ * ## 顺带做点有用功
+ *
+ * 样本取还没扫过投稿数据的 UP，成功的请求直接写进 uploads.json，不浪费。
+ */
+async function rateLimitProbe(ctx) {
+  const { bili } = ctx;
+  const data = cachedFollowings();
+  if (!data) return ctx.usageError('没有关注列表缓存，先跑 bili-station scan follow');
+
+  const known = new Map(store.read('uploads.json', []));
+  const pool = data.list.filter((u) => !known.has(String(u.mid)) || known.get(String(u.mid))?.ok === false);
+  if (pool.length < 100) return ctx.usageError(`可用样本只有 ${pool.length} 个，不够做梯度探针`);
+
+  // 从慢到快。每档固定速率跑 step-size 次，跑干净就进下一档。
+  const STEPS = [2000, 1500, 1200, 900, 700, 500, 350, 250];
+  const STEP_SIZE = ctx.flags['step-size'];
+  const MAX_REQ = ctx.flags['max-requests'];
+  const CONFIRM = 8;            // 首次失败后最多再试这么多次来确认是墙不是抖动
+  const CONFIRM_THRESHOLD = 5;  // 这 CONFIRM 次里失败这么多次就判定为墙
+  const RECOVERY_MIN = ctx.flags['recovery-minutes'];
+
+  ctx.say('限流探针：梯度加速，直到逼出 -412');
+  ctx.say(`  档位 ${STEPS.map((d) => Math.round(60000 / (d + 300)) + '/分').join(' → ')}`);
+  ctx.say(`  每档 ${STEP_SIZE} 次，总上限 ${MAX_REQ} 次，确认撞墙后立即停`);
+  ctx.say(`  样本：${pool.length} 个还没投稿数据的 UP —— 成功的请求会写进 uploads.json，不浪费`);
+  ctx.say('');
+
+  return {
+    data: { steps: STEPS, stepSize: STEP_SIZE, maxRequests: MAX_REQ, poolSize: pool.length },
+    ops: [{
+      label: `限流探针：梯度加速 ${STEPS.length} 档 / 最多 ${MAX_REQ} 次只读请求，逼出限流阈值`,
+      op: 'read',
+      weight: 5,
+      run: async () => {
+        const log = openLog(RATE_LOG);
+        let i = 0, wall = null, authFail = null;
+        const stepStats = [];
+
+        outer:
+        for (const delayMs of STEPS) {
+          const st = { delayMs, reqPerMin: Math.round(60000 / (delayMs + 300)), n: 0, ok: 0, firstFailAtSeq: null };
+          ctx.say(`  ── 档位 ${delayMs}ms（约 ${st.reqPerMin} 次/分）`);
+
+          for (let k = 0; k < STEP_SIZE; k++) {
+            if (i >= MAX_REQ) { ctx.say('  达到请求总数上限，停止'); break outer; }
+            const u = pool[i % pool.length];
+            i++;
+
+            const r = await bili.spaceVideos(u.mid, { ps: 5 });
+            const good = r.ok !== false;
+            log.record({ mid: String(u.mid), code: good ? 0 : r.code, ok: good, delayMs, step: st.reqPerMin });
+            st.n++;
+
+            if (good) {
+              st.ok++;
+              known.set(String(u.mid), {
+                ok: true, count: r.count ?? 0,
+                lastPubTs: r.videos?.[0]?.created ?? null, videos: r.videos,
+              });
+            } else {
+              if (AUTH_CODES.has(r.code)) { authFail = r.code; break outer; }
+              if (st.firstFailAtSeq == null) st.firstFailAtSeq = i;
+
+              if (RISK_CODES.has(r.code)) {
+                ctx.say(`  ⚠ 第 ${i} 次请求撞上 code=${r.code}，再试 ${CONFIRM} 次确认是不是墙…`);
+                let confirmFail = 0;
+                for (let c = 0; c < CONFIRM; c++) {
+                  await sleep(delayMs);
+                  const u2 = pool[i % pool.length];
+                  i++;
+                  const r2 = await bili.spaceVideos(u2.mid, { ps: 5 });
+                  const ok2 = r2.ok !== false;
+                  log.record({ mid: String(u2.mid), code: ok2 ? 0 : r2.code, ok: ok2, delayMs, step: st.reqPerMin, note: 'confirm' });
+                  st.n++;
+                  if (ok2) st.ok++; else confirmFail++;
+                }
+                if (confirmFail >= CONFIRM_THRESHOLD) {
+                  wall = { atSeq: i - CONFIRM, code: r.code, delayMs, reqPerMin: st.reqPerMin, confirmFail, confirmOf: CONFIRM };
+                  ctx.say(`  ✗ 确认撞墙：确认段 ${CONFIRM} 次里失败 ${confirmFail} 次。立即停止（上次就是这里没停，又硬撞了 80 分钟）`);
+                  stepStats.push(st);
+                  break outer;
+                }
+                ctx.say(`  · 确认段只失败 ${confirmFail}/${CONFIRM}，算抖动不算墙，继续`);
+              }
+            }
+            await sleep(delayMs);
+          }
+
+          ctx.say(`     ${st.ok}/${st.n} 成功${st.firstFailAtSeq ? `（第 ${st.firstFailAtSeq} 次有过失败）` : ''}`);
+          stepStats.push(st);
+        }
+
+        store.write('uploads.json', [...known]);
+
+        // ---- 恢复计时：墙什么时候撤，这是最有操作价值的一个数 ----
+        let recovery = null;
+        if (wall && RECOVERY_MIN > 0) {
+          ctx.say('');
+          ctx.say(`  等待恢复：每 2 分钟单发一次请求，最多等 ${RECOVERY_MIN} 分钟`);
+          const t0 = Date.now();
+          for (let m = 2; m <= RECOVERY_MIN; m += 2) {
+            await sleep(120_000);
+            const u = pool[i % pool.length];
+            i++;
+            const r = await bili.spaceVideos(u.mid, { ps: 5 });
+            const good = r.ok !== false;
+            log.record({ mid: String(u.mid), code: good ? 0 : r.code, ok: good, delayMs: 120_000, note: 'recovery' });
+            ctx.say(`     +${m} 分钟：${good ? '✓ 通了' : 'code=' + r.code}`);
+            if (good) {
+              recovery = { minutes: Math.round((Date.now() - t0) / 60000), probes: Math.ceil(m / 2) };
+              known.set(String(u.mid), { ok: true, count: r.count ?? 0, lastPubTs: r.videos?.[0]?.created ?? null, videos: r.videos });
+              store.write('uploads.json', [...known]);
+              break;
+            }
+          }
+          if (!recovery) recovery = { minutes: null, note: `等了 ${RECOVERY_MIN} 分钟仍未恢复` };
+        }
+
+        const curve = analyze(readLog(RATE_LOG));
+        const summary = [
+          authFail ? `⚠ 登录态在探测中失效（code=${authFail}）` : null,
+          wall
+            ? `撞墙：第 ${wall.atSeq} 次请求，档位 ${wall.delayMs}ms（约 ${wall.reqPerMin} 次/分），code=${wall.code}`
+            : `跑完 ${i} 次都没撞墙（最快档 ${STEPS[STEPS.length - 1]}ms）`,
+          curve?.rateAtFirstFail ? `首次失败时的瞬时速率：${curve.rateAtFirstFail.toFixed(1)} 次/分` : null,
+          curve?.leakRateAfterWall != null ? `墙后漏过率：${(curve.leakRateAfterWall * 100).toFixed(1)}%` : null,
+          recovery?.minutes != null ? `恢复耗时：约 ${recovery.minutes} 分钟` : (recovery?.note ?? null),
+          `各档位成绩：${stepStats.map((s) => `${s.reqPerMin}/分 ${s.ok}/${s.n}`).join(' | ')}`,
+          // 两个假设的判据
+          wall && stepStats.length === 1
+            ? '倾向「窗口总量上限」：第一个（最慢的）档位就撞墙了，说明不是速率的问题'
+            : wall
+              ? `倾向「速率上限」：前 ${stepStats.length - 1} 个较慢档位都跑干净了，是提速之后才撞的`
+              : null,
+        ].filter(Boolean);
+        for (const s of summary) ctx.say('  ' + s);
+
+        saveProbe('rate-limit', {
+          wall, recovery, stepStats, curve, totalRequests: i,
+          authFailed: authFail ?? null, logPath: log.path, summary,
+        });
+        return { code: 0, data: { probe: 'rate-limit' } };
+      },
+    }],
+    jobKind: 'probe', resumeKey: 'probe-rate-limit',
+  };
+}

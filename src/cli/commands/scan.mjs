@@ -5,6 +5,7 @@ import { store } from '../context.mjs';
 import { loadCache, saveCache, itemsOf, scanMany } from '../favcache.mjs';
 import { sleep, RiskEngine, RISK_CODES, AUTH_CODES } from '../../risk.mjs';
 import { EXIT } from '../output.mjs';
+import { openLog, readLog, analyze } from '../reqlog.mjs';
 
 export default defineCommand({
   name: 'scan',
@@ -119,6 +120,9 @@ export default defineCommand({
       // 又硬撞了 80 分钟 / 4830 次（-412 占 3900 个），而热度表因为没记录
       // 还一直报 green。三个洞一起补上。
       const risk = new RiskEngine(ctx.cfg.risk, store.read('risk-history.json', null));
+      // 逐次埋点：聚合数字（「4980 次里失败 4595」）答不出「失败从第几次、
+      // 什么速率下开始」，而限流的一切都在时间维度上
+      const log = openLog('scan-uploads.jsonl');
       const MAX_CONSECUTIVE = 5;   // 连续这么多个都撞风控码就认定「墙立起来了」
       const RETRY = 2;
       let done = 0, failed = 0, riskHits = 0, consecutive = 0, added = 0;
@@ -133,6 +137,7 @@ export default defineCommand({
         let r = null;
         for (let attempt = 1; attempt <= RETRY + 1; attempt++) {
           try { r = await fetchOne(u.mid); } catch (e) { r = { ok: false, code: -1, message: e.message }; }
+          log.record({ mid: String(u.mid), code: r.ok === false ? r.code : 0, ok: r.ok !== false, delayMs: ctx.flags.delay, attempt });
           if (r.ok !== false || !RISK_CODES.has(r.code)) break;
           riskHits++;
           if (attempt > RETRY) break;
@@ -179,6 +184,13 @@ export default defineCommand({
       const withVideos = [...known.values()].filter((x) => x.videos?.length).length;
       const okCount = [...known.values()].filter((x) => x.ok !== false).length;
 
+      const curve = analyze(readLog('scan-uploads.jsonl'));
+      if (curve?.firstFailAt) {
+        ctx.say(`曲线：首次失败在第 ${curve.firstFailAt} 次（code=${curve.firstFailCode}），`
+          + `当时瞬时速率 ${curve.rateAtFirstFail?.toFixed(1) ?? '?'} 次/分`
+          + (curve.leakRateAfterWall != null ? `，墙后漏过率 ${(curve.leakRateAfterWall * 100).toFixed(1)}%` : ''));
+      }
+
       const warnings = [];
       if (stopped?.reason === 'risk') {
         warnings.push({
@@ -199,7 +211,7 @@ export default defineCommand({
         data: {
           checked: done, added, failed, riskHits, cached: known.size, ok: okCount,
           withVideos, videosPerUp: nVideos, followings: data.list.length,
-          heat: risk.status().heat, stopped: stopped?.reason ?? null,
+          heat: risk.status().heat, stopped: stopped?.reason ?? null, curve,
           remaining: todo.length - done,
         },
         warnings,
