@@ -31,6 +31,13 @@ export default defineCommand({
         + '实测 500ms 跑到第 ~150 个就会撞 -412 墙，所以默认给到 1200。'
         + '真正的保护是连续失败熔断，不是这个数字',
     },
+    'auto-resume': {
+      type: 'boolean',
+      desc: 'uploads：撞墙后等一段时间自动续跑，直到全部跑完。'
+        + '实测 -412 约 16 分钟自动解除，所以撞墙不是终点。每撞一次自动降速 25%',
+    },
+    'resume-wait': { type: 'int', min: 1, max: 120, default: 20, desc: 'uploads：撞墙后等多少分钟再续跑（实测恢复约 16 分钟）' },
+    'max-walls': { type: 'int', min: 1, max: 20, default: 8, desc: 'uploads：最多容忍撞几次墙，超了就放弃本次' },
     videos: {
       type: 'int', min: 0, max: 50, default: 5,
       desc: 'uploads：每个 UP 取最近 N 条视频的标题/简介/发布时间。0 = 只要最后投稿时间。'
@@ -42,6 +49,7 @@ export default defineCommand({
     'scan uploads --limit 300',
     'scan uploads --videos 0        # 只判断停更，最省',
     'scan uploads --videos 10       # 给语义判断留足证据',
+    'scan uploads --auto-resume     # 撞墙自动等待续跑，一次跑完',
     'scan sample --folder 106154023 --ratio 0.3',
   ],
 
@@ -127,17 +135,31 @@ export default defineCommand({
       const RETRY = 2;
       let done = 0, failed = 0, riskHits = 0, consecutive = 0, added = 0;
       let stopped = null;
+      let delayMs = ctx.flags.delay;
+      const walls = [];
 
       const fetchOne = async (mid) => (nVideos === 0
         ? ctx.bili.lastUpload(mid)
         : ctx.bili.spaceVideos(mid, { ps: nVideos }));
 
-      for (const u of todo) {
+      // 自动续跑：撞墙不是终点。实测恢复约 16 分钟，等一会儿就能接着跑。
+      // 每撞一次墙降速 25% —— 这是项目里执行器已有的 AIMD 思路：让它自己收敛到
+      // 安全速率，而不是反复撞同一堵墙。
+      let queue = todo;
+      let pass = 0;
+
+      while (queue.length) {
+      pass++;
+      stopped = null;
+      consecutive = 0;
+      if (pass > 1) ctx.say(`  ── 第 ${pass} 轮，剩 ${queue.length} 个，间隔 ${delayMs}ms（约 ${Math.round(60000 / (delayMs + 300))} 次/分）`);
+
+      for (const u of queue) {
         if (stopped) break;
         let r = null;
         for (let attempt = 1; attempt <= RETRY + 1; attempt++) {
           try { r = await fetchOne(u.mid); } catch (e) { r = { ok: false, code: -1, message: e.message }; }
-          log.record({ mid: String(u.mid), code: r.ok === false ? r.code : 0, ok: r.ok !== false, delayMs: ctx.flags.delay, attempt });
+          log.record({ mid: String(u.mid), code: r.ok === false ? r.code : 0, ok: r.ok !== false, delayMs, attempt, pass });
           if (r.ok !== false || !RISK_CODES.has(r.code)) break;
           riskHits++;
           if (attempt > RETRY) break;
@@ -176,7 +198,31 @@ export default defineCommand({
           store.write('risk-history.json', risk.toJSON());
           ctx.say(`  ${done}/${todo.length}${failed ? `（失败 ${failed}）` : ''}  热度 ${risk.status().heat}/100`);
         }
-        if (!stopped && done < todo.length) await sleep(ctx.flags.delay + Math.random() * 600);
+        if (!stopped) await sleep(delayMs + Math.random() * 600);
+      }
+
+      store.write('uploads.json', [...known]);
+      store.write('risk-history.json', risk.toJSON());
+
+      // 没撞墙就是跑完了；AUTH 失效直接放弃，续跑也没用
+      if (!stopped || stopped.reason === 'auth') break;
+
+      walls.push({ pass, atDone: done, code: stopped.code, delayMs, reqPerMin: Math.round(60000 / (delayMs + 300)) });
+      if (!ctx.flags['auto-resume']) break;
+      if (walls.length > ctx.flags['max-walls']) {
+        ctx.say(`  ✗ 已经撞墙 ${walls.length} 次，超过 --max-walls ${ctx.flags['max-walls']}，放弃本次`);
+        break;
+      }
+
+      // 重算剩余：撞墙那几个的失败没落盘，重算能自然把它们捡回来
+      queue = queue.filter((x) => !enough(known.get(String(x.mid))));
+      if (!queue.length) break;
+
+      const oldDelay = delayMs;
+      delayMs = Math.min(5000, Math.round(delayMs * 1.25));
+      const waitMin = ctx.flags['resume-wait'];
+      ctx.say(`  ⏸ 第 ${walls.length} 次撞墙（code=${stopped.code}）。降速 ${oldDelay} → ${delayMs}ms，等 ${waitMin} 分钟后续跑，还剩 ${queue.length} 个`);
+      await sleep(waitMin * 60_000);
       }
 
       store.write('uploads.json', [...known]);
@@ -192,6 +238,14 @@ export default defineCommand({
       }
 
       const warnings = [];
+      if (walls.length && !stopped) {
+        warnings.push({
+          code: 'WALLS_SURVIVED',
+          message: `中途撞墙 ${walls.length} 次，每次等待后自动续跑并降速，最终跑完。`
+            + `间隔从 ${ctx.flags.delay}ms 收敛到 ${delayMs}ms（约 ${Math.round(60000 / (delayMs + 300))} 次/分）。`
+            + `撞墙点：${walls.map((w) => `第${w.atDone}个@${w.reqPerMin}次/分`).join('、')}`,
+        });
+      }
       if (stopped?.reason === 'risk') {
         warnings.push({
           code: 'RISK_WALL',
@@ -212,6 +266,7 @@ export default defineCommand({
           checked: done, added, failed, riskHits, cached: known.size, ok: okCount,
           withVideos, videosPerUp: nVideos, followings: data.list.length,
           heat: risk.status().heat, stopped: stopped?.reason ?? null, curve,
+          walls, passes: walls.length + 1, finalDelayMs: delayMs,
           remaining: todo.length - done,
         },
         warnings,
