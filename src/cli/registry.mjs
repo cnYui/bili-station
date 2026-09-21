@@ -28,6 +28,12 @@ export const GLOBAL_FLAGS = {
 export const CAPABILITY_FLAGS = {
   mutating: {
     yes: { type: 'boolean', desc: '真正执行。不加则一律干跑，只打印计划' },
+    'auto-rounds': {
+      type: 'boolean',
+      desc: '写操作超过单轮硬上限时自动拆轮连续执行。硬上限是防「一次性几百次无间隔写入」'
+        + '的，多轮之间留足冷却就是它本来的用法',
+    },
+    'round-pause': { type: 'int', min: 0, max: 60, default: 5, desc: '自动拆轮时每轮之间停多少分钟' },
   },
   ordered: {
     order: {

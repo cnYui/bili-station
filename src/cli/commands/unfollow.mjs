@@ -20,6 +20,11 @@ export default defineCommand({
         + '大号返回 code 0 + count 0（空间隐私 / 账号迁移 / 限流期间的空响应），会误取关',
     },
     'protect-tag': { type: 'csv', desc: '这些分组里的 UP 无条件保留（分组名或 tagid）' },
+    'include-special': {
+      type: 'boolean',
+      desc: '把特别关注也纳入取关范围。默认无条件保留 —— 特别关注是比普通关注'
+        + '更强的意图信号，绝不能因为规则命中就顺手带走。备份里会单独标出来',
+    },
     refresh: { type: 'boolean', desc: '强制重新拉取关注列表' },
   },
   examples: [
@@ -53,7 +58,13 @@ export default defineCommand({
       inactive: d.uploads,
       onlyInactive: !!flags['only-inactive'],
       zeroUploadIsStale: !!flags['include-zero-upload'],
+      includeSpecial: !!flags['include-special'],
     });
+
+    if (flags['include-special']) {
+      const n = p.targets.filter((u) => d.special.has(String(u.mid))).length;
+      if (n) warnings.push({ code: 'SPECIAL_INCLUDED', message: `其中 ${n} 个是特别关注，按 --include-special 一并取关。备份里已单独标记，可据此挑回来。` });
+    }
 
     // 零投稿的单独点出来：它们不在目标里，但用户多半想知道有这么一批
     const zeroUpload = [...d.uploads].filter(([, v]) => v?.ok !== false && (v.count ?? 0) === 0).map(([mid]) => mid);
@@ -80,6 +91,7 @@ export default defineCommand({
       data: {
         total: p.total, willUnfollow: p.targets.length, kept: p.keptCount,
         zeroUploadSkipped: flags['include-zero-upload'] ? 0 : zeroUpload.length,
+        specialIncluded: flags['include-special'] ? p.targets.filter((u) => d.special.has(String(u.mid))).length : 0,
         withUploadData: [...d.uploads.values()].filter((v) => v?.ok !== false).length,
         protectedByTag: protectTags.size, specialKept: d.special.size,
         byReason: p.summary.byReason, truncated: d.truncated,
@@ -92,7 +104,11 @@ export default defineCommand({
       backup: {
         kind: 'unfollow',
         payload: {
-          targets: p.targets.map((u) => ({ mid: u.mid, uname: u.uname, reason: p.reasons.get(String(u.mid)), tags: tagsOf(u, d.special) })),
+          targets: p.targets.map((u) => ({
+            mid: u.mid, uname: u.uname, reason: p.reasons.get(String(u.mid)),
+            tags: tagsOf(u, d.special),
+            wasSpecial: d.special.has(String(u.mid)) || !!u.special,   // 恢复时要用
+          })),
           snapshot: { total: d.list.length, truncated: d.truncated },
         },
       },
