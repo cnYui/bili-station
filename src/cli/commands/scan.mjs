@@ -23,10 +23,17 @@ export default defineCommand({
     ratio: { type: 'float', min: 0.01, max: 1, default: 0.25, desc: 'sample：抽样比例' },
     out: { type: 'path', desc: 'sample：样本输出路径' },
     limit: { type: 'int', min: 1, desc: 'uploads：只查前 N 个（按最近关注排序）' },
+    videos: {
+      type: 'int', min: 0, max: 30, default: 5,
+      desc: 'uploads：每个 UP 取最近 N 条视频的标题/简介/发布时间。0 = 只要最后投稿时间。'
+        + '取 1 条和取 20 条是同一次请求，不影响调用次数',
+    },
   },
   examples: [
     'scan fav --folder 106154023',
     'scan uploads --limit 300',
+    'scan uploads --videos 0        # 只判断停更，最省',
+    'scan uploads --videos 10       # 给语义判断留足证据',
     'scan sample --folder 106154023 --ratio 0.3',
   ],
 
@@ -77,16 +84,37 @@ export default defineCommand({
         store.write('followings.json', data);
       }
       const known = new Map(store.read('uploads.json', []));
+      const nVideos = ctx.flags.videos;
       let list = data.list;
       if (ctx.flags.limit) list = list.slice(0, ctx.flags.limit);
-      const todo = ctx.flags.refresh ? list : list.filter((u) => !known.has(String(u.mid)));
 
+      // 已有记录但视频条数不够时也要重查 —— 否则先跑了 --videos 0 再跑 --videos 5 会全被跳过
+      const enough = (rec) => rec && rec.ok !== false && (nVideos === 0 || (rec.videos?.length ?? 0) >= Math.min(nVideos, rec.count ?? 0));
+      const todo = ctx.flags.refresh ? list : list.filter((u) => !enough(known.get(String(u.mid))));
+
+      const perReq = 1.0;   // 平均每次请求含间隔的耗时（秒），按下面的 sleep 估
       ctx.say(`关注 ${data.list.length} 个，本次需要查 ${todo.length} 个（已有 ${known.size} 条缓存）`);
+      ctx.say(nVideos === 0
+        ? '只取最后投稿时间（够用来判断停更）'
+        : `每个 UP 取最近 ${nVideos} 条视频的标题/简介/发布时间 —— 和只取时间是同一次请求，不多花调用`);
+      if (todo.length > 200) {
+        ctx.say(`预计约 ${Math.ceil(todo.length * perReq / 60)} 分钟。这是只读操作，中断了重跑会接着查。`);
+      }
+
       let done = 0, failed = 0;
       for (const u of todo) {
         try {
-          const info = await ctx.bili.lastUpload(u.mid);
-          known.set(String(u.mid), info);
+          const r = nVideos === 0
+            ? await ctx.bili.lastUpload(u.mid)
+            : await ctx.bili.spaceVideos(u.mid, { ps: nVideos });
+          // 统一成 planUnfollow 认的形状：{count, lastPubTs}，外加可选的 videos
+          known.set(String(u.mid), r.ok === false ? { ok: false, code: r.code } : {
+            ok: true,
+            count: r.count ?? 0,
+            lastPubTs: r.lastPubTs ?? r.videos?.[0]?.created ?? null,
+            ...(r.videos ? { videos: r.videos } : {}),
+          });
+          if (r.ok === false) failed++;
         } catch { failed++; }
         done++;
         if (done % 25 === 0) {
@@ -97,9 +125,10 @@ export default defineCommand({
         if (done < todo.length) await sleep(700 + Math.random() * 600);
       }
       store.write('uploads.json', [...known]);
+      const withVideos = [...known.values()].filter((x) => x.videos?.length).length;
       return {
-        data: { checked: done, failed, cached: known.size, followings: data.list.length },
-        warnings: failed ? [{ code: 'PARTIAL', message: `${failed} 个 UP 的投稿信息没查到，重跑会补` }] : [],
+        data: { checked: done, failed, cached: known.size, withVideos, videosPerUp: nVideos, followings: data.list.length },
+        warnings: failed ? [{ code: 'PARTIAL', message: `${failed} 个 UP 的投稿信息没查到（私密空间 / 限流），重跑会补` }] : [],
       };
     }
 
@@ -143,8 +172,10 @@ export default defineCommand({
       }
       ctx.say(`合计 ${d.total} 条`);
     } else if (d.checked != null) {
-      ctx.say(`投稿信息：本次查了 ${d.checked} 个，累计缓存 ${d.cached} 条`);
-      ctx.say('现在 unfollow --inactive-days / --only-inactive 可以正常工作了。');
+      ctx.say(`投稿信息：本次查了 ${d.checked} 个，累计缓存 ${d.cached} 条${d.withVideos ? `（其中 ${d.withVideos} 个带视频详情）` : ''}`);
+      ctx.say('现在可以用了：');
+      ctx.say('  确定性过滤   unfollow --only-inactive --inactive-days 365');
+      if (d.withVideos) ctx.say('  语义裁决     follow remove --inactive-days 180 --emit-candidates cand.json');
     } else if (d.sampled != null) {
       ctx.say(`样本 ${d.sampled} 条（${d.sampledPages}/${d.totalPages} 页）已写入 ${d.out}`);
     } else if (d.count != null) {

@@ -217,7 +217,39 @@ export class Bili {
     return this.post(API + '/x/relation/tag/del', { tagid: String(tagid) });
   }
 
-  /** UP 主最近投稿时间，用于判断停更 / 僵尸号。需 wbi 签名。 */
+  /**
+   * UP 主空间的近期投稿。需 wbi 签名。
+   *
+   * 关键性质：**拿 1 条和拿 20 条是同一次请求**，代价只是响应大一点。
+   * 所以判断停更只要时间戳时用 ps=1，要做语义判断（内容转型 / 恰饭 / 方向变了）
+   * 就直接多拿几条标题和简介，不会多花一次调用。
+   *
+   * 真正的成本在 UP 主个数：5000 个关注就是 5000 次请求。
+   *
+   * @returns {{ok, count, videos: Array<{bvid,title,desc,created,play,length,typeid}>}}
+   */
+  async spaceVideos(mid, { ps = 5, introLen = 120 } = {}) {
+    const url = this.signed('/x/space/wbi/arc/search', { mid, ps, pn: 1, order: 'pubdate' });
+    const r = await this.get(url);
+    if (r?.code !== 0) return { ok: false, code: r?.code, message: r?.message };
+    const vlist = r.data?.list?.vlist ?? [];
+    return {
+      ok: true,
+      count: r.data?.page?.count ?? 0,
+      videos: vlist.map((v) => ({
+        bvid: v.bvid,
+        title: v.title,
+        // 简介截断：5000 个 UP × 若干条视频，全文存下来会让 uploads.json 大到难用
+        desc: String(v.description ?? '').replace(/\s+/g, ' ').trim().slice(0, introLen),
+        created: v.created,
+        play: v.play,
+        length: v.length,
+        typeid: v.typeid ?? null,
+      })),
+    };
+  }
+
+  /** 只要「最后投稿时间 + 投稿数」时用这个。planUnfollow 依赖 {count, lastPubTs}。 */
   async lastUpload(mid) {
     const url = this.signed('/x/space/wbi/arc/search', { mid, ps: 1, pn: 1, order: 'pubdate' });
     const r = await this.get(url);

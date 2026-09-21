@@ -113,7 +113,23 @@ B 站的 move/copy 会把 `fav_time` 重写成操作时间，所以**提交顺�
 bili-station follow list --tag 编程 --json
 bili-station follow list --state special --json
 bili-station follow tag create "长期追更" --yes --json
-bili-station scan uploads --json        # --inactive-days 依赖它，不跑就恒命中 0 个
+bili-station scan uploads --videos 5 --json   # 投稿时间 + 最近 5 条视频的标题/简介
+```
+
+**先分清确定性和语义。** 「一年没更新」「投稿数为 0」这类有精确判据的，
+用确定性过滤，别交给模型：
+
+```bash
+bili-station unfollow --only-inactive --inactive-days 365 --json
+```
+
+只有「内容转型了」「全是恰饭」「和我关注的方向无关」这类才需要语义裁决：
+
+```bash
+bili-station follow remove --inactive-days 180 --query "<用户原话>" --emit-candidates c.json --json
+# 你读 candidates 里的 recentVideos 判断，写 {"selected":{"<uid>":"<理由>"}}
+bili-station follow remove --apply picked.json --json        # 干跑
+bili-station follow remove --apply picked.json --yes --json  # 执行
 ```
 
 **特别关注受配额限制**：22117 的 message 是「特殊关注达到上限」。写入路径是通的，

@@ -33,6 +33,7 @@ export default defineCommand({
     'inactive-days': { type: 'int', min: 1, desc: '超过 N 天没投稿算停更（需要先 scan uploads）' },
     refresh: { type: 'boolean', desc: '强制重新拉取关注列表' },
     limit: { type: 'int', min: 1, desc: 'list：只显示前 N 个' },
+    query: { type: 'string', desc: '把你的原话记进候选清单，作为审计链的起点（原话→清单→逐条理由→备份）' },
   },
   examples: [
     'follow list --tag 编程',
@@ -79,27 +80,44 @@ export default defineCommand({
       const pool = filterUsers(d, flags);
 
       if (!explicit.length && !flags.apply) {
+        const nowSec = Math.floor(Date.now() / 1000);
+        const hasVideos = pool.some((u) => d.uploads.get(String(u.mid))?.videos?.length);
         // 吐候选清单，交给调用方（你 / agent / 自然语言）裁决
         const sel = buildSelection({
           kind: 'unfollow',
-          candidates: pool.map((u) => ({
-            id: String(u.mid), uname: u.uname,
-            state: stateOf(u, d.special),
-            tags: tagsOf(u, d.special).map((t) => d.tagById.get(t)?.name ?? String(t)),
-            followedAt: u.mtime ?? null,
-            lastPubTs: d.uploads.get(String(u.mid))?.lastPubTs ?? null,
-            uploadCount: d.uploads.get(String(u.mid))?.count ?? null,
-            sign: (u.sign ?? '').slice(0, 60),
-          })),
+          candidates: pool.map((u) => {
+            const up = d.uploads.get(String(u.mid));
+            const days = up?.lastPubTs ? Math.floor((nowSec - up.lastPubTs) / 86400) : null;
+            return {
+              id: String(u.mid), uname: u.uname,
+              state: stateOf(u, d.special),
+              tags: tagsOf(u, d.special).map((t) => d.tagById.get(t)?.name ?? String(t)),
+              followedAt: u.mtime ?? null,
+              sign: (u.sign ?? '').slice(0, 80),
+              uploadCount: up?.count ?? null,
+              lastPubTs: up?.lastPubTs ?? null,
+              // 天数直接算好：让裁决方去做日期运算是白白制造出错机会
+              daysSinceLastPub: days,
+              // 语义判断的核心证据。没跑过 scan uploads --videos 时为空，
+              // 这时只能做「停更多久」这类确定性判断，判断不了「内容转型」。
+              recentVideos: (up?.videos ?? []).map((v) => ({
+                title: v.title, desc: v.desc, publishedAt: v.created,
+              })),
+            };
+          }),
           protectedIds,
+          query: flags.query ?? null,
           maxSelect: flags['max-select'] ?? null,
-          note: '特别关注已标 protected，选中会被整份拒收。',
+          note: '特别关注已标 protected，选中会被整份拒收。'
+            + (hasVideos ? '' : ' 注意：本次清单里没有视频详情（未跑 scan uploads --videos），只能按停更时长这类硬指标判断。'),
         });
         if (flags['emit-candidates']) {
           writeSelection(flags['emit-candidates'], sel);
           ctx.say(`候选清单（${sel.candidates.length} 个）已写入 ${flags['emit-candidates']}`);
         }
         process.stdout.write(JSON.stringify(sel, null, 2) + '\n');
+        ctx.say(`候选 ${sel.candidates.length} 个，${hasVideos ? '带' : '不带'}视频详情。`);
+        if (!hasVideos) ctx.say('想按内容语义判断（转型 / 恰饭 / 方向变了），先跑 bili-station scan uploads --videos 5');
         ctx.say('挑出要取关的，存成 {"selected":{"<uid>":"<理由>"}} 后用 --apply <文件> 回填。理由必填。');
         return { handled: true };
       }
