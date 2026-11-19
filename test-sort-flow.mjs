@@ -14,7 +14,8 @@ import { join } from 'node:path';
 process.env.BILI_STATION_DIR = mkdtempSync(join(tmpdir(), 'bili-station-test-'));
 
 const { planFavClassify, planMerge } = await import('./src/plan.mjs');
-const { Job, buildFavOps, buildMergeOps } = await import('./src/executor.mjs');
+const { Job, buildFavOps, buildMergeOps, buildReorderOps, buildPrivacyOps } = await import('./src/executor.mjs');
+const { orderItems } = await import('./src/order.mjs');
 const { buildTasks, applyExternalAssignment } = await import('./src/classify/external.mjs');
 const { write, DATA_DIR } = await import('./src/store.mjs');
 
@@ -268,6 +269,209 @@ section('合并执行');
   const delivered = b.moved.flatMap((m) => m.res.map((x) => x.split(':')[0]));
   eq('投递条数 = 计划总数', delivered.length, p.total);
   eq('没有重复投递', new Set(delivered).size, delivered.length);
+}
+
+// ---------- 夹内重排 ----------
+section('夹内重排');
+
+/**
+ * 比上面那个 FakeBili 严格的假后端：它真的模拟 B 站三条实测行为 ——
+ *   1. move 进另一个夹会把 fav_time 重写成操作时间，**同一批共用一个时间戳**
+ *   2. 列表按 fav_time 降序返回
+ *   3. 时间戳相同时，**批内显示次序 = 提交次序的逆序**（受控实验结论，见 order.mjs）
+ * 第 3 条最容易漏掉。漏了就会以为精度只到批粒度，从而写出过度保守的实现。
+ */
+class FakeFavStore {
+  constructor() { this.clock = 10_000; this.f = new Map(); this.calls = []; }
+  seed(id, items) { this.f.set(id, items.map((x, i) => ({ ...x, seq: i }))); }
+  display(id) { return [...(this.f.get(id) ?? [])].sort((a, b) => b.favTime - a.favTime || a.seq - b.seq); }
+  async favFolders() {
+    return [...this.f.keys()].map((id) => ({ id, title: 'f' + id, count: this.f.get(id).length, attr: 23 }));
+  }
+  async moveResources(src, tar, res) {
+    this.calls.push({ src, tar, n: res.length });
+    const ids = new Set(res.map((r) => String(r).split(':')[0]));
+    const from = this.f.get(src) ?? [];
+    this.f.set(src, from.filter((x) => !ids.has(String(x.id))));
+    const t = ++this.clock;   // 同批一个时间戳
+    const go = from.filter((x) => ids.has(String(x.id)));
+    const to = this.f.get(tar) ?? [];
+    // 批内也是「先提交的排后面」，所以 seq 按提交次序递减
+    this.f.set(tar, [...to, ...go.map((x, i) => ({ ...x, favTime: t, seq: go.length - i }))]);
+    return { code: 0, data: {} };
+  }
+}
+
+/** 造一个「被搬运过」的夹：真实收藏时间递增，但账号上的当前 fav_time 是反的 */
+const strandedItems = (n) => Array.from({ length: n }, (_, i) => ({
+  id: i + 1, type: 2, title: 't' + (i + 1),
+  trueFav: 1000 + i,   // 真实收藏时间，越大越新
+  favTime: 9000 - i,   // 账号上的当前值：被搬运重写过，次序是反的
+}));
+
+{
+  const N = 45;
+  const items = strandedItems(N);
+  const fake = new FakeFavStore();
+  fake.seed(201, items);
+  fake.seed(202, []);   // 中转夹
+
+  eq('重排前最上面的是收藏时间最旧的那条（就是用户遇到的状态）', fake.display(201)[0].id, 1);
+
+  // 回灌真实收藏时间后再算提交顺序
+  const ordered = orderItems(items.map((x) => ({ ...x, favTime: x.trueFav })), 'original');
+  const ops = buildReorderOps(fake, [{ id: 201, title: 'f201', out: ordered, ordered }], { id: 202 }, { chunkSize: 20 });
+
+  eq('45 条 → 搬出 3 批 + 搬回 3 批', ops.length, 6);
+  ok('前一半是搬出', ops.slice(0, 3).every((o) => o.key.startsWith('ro-out:')));
+  ok('后一半是搬回', ops.slice(3).every((o) => o.key.startsWith('ro-in:')));
+  ok('全部按 favMove 计权', ops.every((o) => o.op === 'favMove'));
+
+  resetResume();
+  const snap = await new Job('r1', 'reorder', { dryRun: false, riskOpts: fastRisk, resumeKey: 'selftest-reorder' }).run(ops);
+
+  eq('无失败', snap.counters.failed, 0);
+  const after = fake.display(201);
+  eq('条目一条不少', after.length, N);
+  eq('中转夹已清空', fake.f.get(202).length, 0);
+  eq('重排后最上面的是收藏时间最新的那条', after[0].id, N);
+  eq('重排后最下面的是收藏时间最旧的那条', after[after.length - 1].id, 1);
+  // 批内也遵循同一条规律，所以精度到逐条：整份次序必须严格等于收藏时间降序
+  eq('整份次序严格等于真实收藏时间降序', after.map((x) => x.id),
+    Array.from({ length: N }, (_, i) => N - i));
+
+  const blocks = [];
+  for (const it of after) {
+    const last = blocks[blocks.length - 1];
+    if (last && last.t === it.favTime) last.ids.push(it.id); else blocks.push({ t: it.favTime, ids: [it.id] });
+  }
+  eq('仍然是 3 个时间戳块（同批共用时间戳这点没变）', blocks.length, 3);
+  ok('块与块之间严格递减', blocks.every((b, i) => i === 0 || Math.max(...b.ids) < Math.min(...blocks[i - 1].ids)));
+
+  eq('搬运调用数 = 3 出 + 3 回', fake.calls.length, 6);
+  ok('搬出都是 201→202', fake.calls.slice(0, 3).every((c) => c.src === 201 && c.tar === 202));
+  ok('搬回都是 202→201', fake.calls.slice(3).every((c) => c.src === 202 && c.tar === 201));
+}
+
+{
+  // chunk-size 1：每条独占一个时间戳，次序精确到条（代价是 20 倍调用次数）
+  const N = 8;
+  const items = strandedItems(N);
+  const fake = new FakeFavStore();
+  fake.seed(301, items);
+  fake.seed(302, []);
+  const ordered = orderItems(items.map((x) => ({ ...x, favTime: x.trueFav })), 'original');
+  const ops = buildReorderOps(fake, [{ id: 301, title: 'f301', out: ordered, ordered }], { id: 302 }, { chunkSize: 1 });
+
+  resetResume();
+  await new Job('r2', 'reorder', { dryRun: false, riskOpts: fastRisk, resumeKey: 'selftest-reorder' }).run(ops);
+
+  eq('chunkSize=1 时调用数是 2n', ops.length, N * 2);
+  eq('次序精确到每一条', fake.display(301).map((x) => x.id), [8, 7, 6, 5, 4, 3, 2, 1]);
+}
+
+{
+  // 混类型：番剧（type=24）和普通视频（type=2）绝不能落在同一批 ——
+  // fav_time 并列时 B 站会把番剧排到普通视频前面，同批混装就会错位。
+  const items = [
+    ...strandedItems(25),
+    { id: 900, type: 24, title: '番剧A', trueFav: 1012, favTime: 8000 },
+    { id: 901, type: 24, title: '番剧B', trueFav: 1018, favTime: 8001 },
+  ];
+  const ordered = orderItems(items.map((x) => ({ ...x, favTime: x.trueFav })), 'original');
+  const ops = buildReorderOps({}, [{ id: 501, title: 'f501', out: ordered, ordered }], { id: 502 }, { chunkSize: 20 });
+  const back = ops.filter((o) => o.key.startsWith('ro-in:'));
+
+  const idsOf = (o) => o.key.split(':').pop().split('_');
+  const typeOf = new Map(items.map((x) => [String(x.id), x.type]));
+  ok('每个搬回批次只含一种类型', back.every((o) => new Set(idsOf(o).map((id) => typeOf.get(id))).size === 1));
+  ok('类型交错处断开，所以批数多于 ⌈27/20⌉', back.length > Math.ceil(27 / 20));
+  eq('搬回覆盖的条目数仍是全部', back.reduce((n, o) => n + idsOf(o).length, 0), 27);
+  // 搬出不影响次序，不必按类型切
+  eq('搬出仍按 20 整批切', ops.filter((o) => o.key.startsWith('ro-out:')).length, 2);
+}
+
+{
+  // 断点 key 必须区分「同一计划的续跑」和「另起的新计划」。
+  // 少了这一层，上一轮跑完的 key 会被新计划原样撞上，搬出被当成做过而跳过 ——
+  // 条目没进中转夹，搬回全部搬空。这是实际踩过的坑。
+  const items = strandedItems(25);
+  const mk = (planId) => buildReorderOps({}, [{ id: 601, title: 'f601', out: items, ordered: items }],
+    { id: 602 }, { chunkSize: 20, planId });
+
+  const a = mk('2026-09-21T14:05:36Z');
+  const b2 = mk('2026-09-21T23:22:41Z');
+  eq('两份计划的 op 数量相同', a.length, b2.length);
+  ok('但没有任何一个 key 相同 —— 新计划不会被旧断点误跳',
+    a.every((o) => !b2.some((x) => x.key === o.key)));
+  ok('同一个 planId 重建出的 key 完全一致 —— 续跑仍能正确跳过',
+    mk('2026-09-21T14:05:36Z').every((o, i) => o.key === a[i].key));
+  ok('不给 planId 时 key 仍然可用（向后兼容）', mk('').every((o) => o.key.includes('601')));
+}
+
+{
+  // 多个夹：每个夹必须自己搬出、自己搬回，绝不能把内容串到别的夹里
+  const fake = new FakeFavStore();
+  fake.seed(401, strandedItems(5));
+  fake.seed(402, strandedItems(3).map((x) => ({ ...x, id: x.id + 100 })));
+  fake.seed(403, []);
+  const jobs = [401, 402].map((id) => {
+    const src = fake.display(id);
+    const ordered = orderItems(src.map((x) => ({ ...x, favTime: x.trueFav })), 'original');
+    return { id, title: 'f' + id, out: ordered, ordered };
+  });
+  const ops = buildReorderOps(fake, jobs, { id: 403 }, { chunkSize: 20 });
+
+  resetResume();
+  await new Job('r3', 'reorder', { dryRun: false, riskOpts: fastRisk, resumeKey: 'selftest-reorder' }).run(ops);
+
+  eq('401 条数不变', fake.display(401).length, 5);
+  eq('402 条数不变', fake.display(402).length, 3);
+  eq('中转夹清空', fake.f.get(403).length, 0);
+  ok('401 里没有混进 402 的条目', fake.display(401).every((x) => x.id <= 100));
+  ok('402 里没有混进 401 的条目', fake.display(402).every((x) => x.id > 100));
+  eq('401 顶部是它自己收藏时间最新的', fake.display(401)[0].id, 5);
+  eq('402 顶部是它自己收藏时间最新的', fake.display(402)[0].id, 103);
+}
+
+// ---------- 收藏夹隐私 ----------
+section('收藏夹隐私');
+{
+  class FakePrivacyBili {
+    constructor() { this.infos = new Map(); this.infoCalls = []; this.edits = []; }
+    async folderInfo(id) { this.infoCalls.push(id); return this.infos.get(id) ?? null; }
+    async editFolder(id, body) { this.edits.push({ id, ...body }); return { code: 0 }; }
+  }
+  const b = new FakePrivacyBili();
+  b.infos.set(1, { id: 1, title: '已公开的夹', intro: '简介A', attr: 22 });
+  b.infos.set(2, { id: 2, title: '私密夹', intro: '简介B', attr: 23 });
+  b.infos.set(3, { id: 3, title: '带额外位的私密夹', intro: '简介C', attr: 55 });
+  // 4 号故意读不到详情
+
+  const targets = [1, 2, 3, 4].map((id) => ({ id, title: 'f' + id }));
+  const ops = buildPrivacyOps(b, targets, 0);
+  ok('隐私修改按 folderAdd 计权（夹级写操作最敏感的那档）', ops.every((o) => o.op === 'folderAdd'));
+
+  const r1 = await ops[0].run();
+  ok('已经是公开的夹直接跳过', r1?._already === true);
+  eq('跳过时不发编辑请求', b.edits.length, 0);
+
+  await ops[1].run();
+  eq('需要改的夹发了编辑请求', b.edits.length, 1);
+  eq('title 原样回传', b.edits[0].title, '私密夹');
+  eq('intro 原样回传（缺它 B 站会把简介清空）', b.edits[0].intro, '简介B');
+  eq('privacy 设为 0', b.edits[0].privacy, 0);
+
+  await ops[2].run();
+  eq('attr=55 带额外位的也认得出要改', b.edits.length, 2);
+  eq('改的是 3 号', b.edits[1].id, 3);
+
+  const r4 = await ops[3].run();
+  ok('读不到详情时返回非 0', r4?.code !== 0);
+  eq('读不到详情时绝不发编辑请求 —— 宁可不改，也不拿空 intro 覆盖简介', b.edits.length, 2);
+
+  const back = buildPrivacyOps(b, [{ id: 2, title: 'f2' }], 1);
+  ok('改回私密时 key 与改公开的不同，断点不会互相误跳', back[0].key !== ops[1].key);
 }
 
 console.log('\n' + '='.repeat(56));

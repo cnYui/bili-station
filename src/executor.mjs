@@ -5,6 +5,8 @@
 import { RiskEngine, classifyResult, sleep } from './risk.mjs';
 import * as store from './store.mjs';
 import { chunk, toResource } from './plan.mjs';
+import { orderItems, chunkBySource } from './order.mjs';
+import { PRIVACY, isPrivateAttr } from './bili.mjs';
 
 export class Job {
   constructor(id, kind, { dryRun = true, riskOpts = {}, resumeKey = null } = {}) {
@@ -205,6 +207,89 @@ export function buildUnfollowOps(bili, targets) {
   }));
 }
 
+/**
+ * 关系变更（关注 / 取关 / 悄悄关注 / 取消悄悄关注）。
+ * 每个 mid 单独成 op —— 关系接口没有批量形式，而且权重高，逐个做才好控速。
+ */
+export function buildRelationOps(bili, targets, act, { opName = 'follow', verb = '操作', reasons = null } = {}) {
+  return targets.map((u) => ({
+    key: opName + ':' + act + ':' + u.mid,
+    label: verb + ' ' + (u.uname ?? u.mid) + '（UID ' + u.mid + '）'
+      + (reasons?.get(String(u.mid)) ? ' — ' + reasons.get(String(u.mid)) : ''),
+    op: opName,
+    run: () => bili.modifyRelation(u.mid, act),
+  }));
+}
+
+/** 分组本身的增删改。逐个做，权重按 tagEdit 计。 */
+export function buildTagAdminOps(bili, { creates = [], renames = [], deletes = [] } = {}, tagIds = new Map()) {
+  const ops = [];
+  for (const name of creates) {
+    ops.push({
+      label: '新建分组「' + name + '」',
+      op: 'tagEdit',
+      run: async () => {
+        // 幂等：先看是不是已经存在（重跑 / 上次建到一半）
+        const fresh = await bili.tags();
+        const hit = fresh.find((t) => String(t.name).trim() === String(name).trim());
+        if (hit) { tagIds.set(name, hit.tagid); return { code: 0, data: { tagid: hit.tagid }, _reused: true }; }
+        const body = await bili.createTag(name);
+        const id = body?.data?.tagid ?? body?.data?.tag_id;
+        if (body?.code === 0 && id != null) tagIds.set(name, id);
+        return body;
+      },
+    });
+  }
+  for (const r of renames) {
+    ops.push({
+      key: 'tagRename:' + r.tagid + ':' + r.to,
+      label: '分组改名「' + r.from + '」→「' + r.to + '」',
+      op: 'tagEdit',
+      run: () => bili.renameTag(r.tagid, r.to),
+    });
+  }
+  for (const d of deletes) {
+    ops.push({
+      key: 'tagDelete:' + d.tagid,
+      label: '删除分组「' + d.name + '」（组内 UP 不会被取关）',
+      op: 'tagEdit',
+      run: () => bili.deleteTag(d.tagid),
+    });
+  }
+  return ops;
+}
+
+/**
+ * 设置用户的**完整**分组归属。
+ *
+ * setUserTags 是覆盖语义（传进去的就是之后的全部分组），所以调用方必须给出
+ * 完整的目标集合，而不是「要加的那个」。把相同目标集合的 mid 合并成一批发送。
+ *
+ * @param {Map<string, number[]>} desired  mid -> 目标分组 id 列表（空数组 = 回到默认分组）
+ */
+export function buildUserTagOps(bili, desired, { batchSize = 20, labelOf = null } = {}) {
+  const bySig = new Map();
+  for (const [mid, tagids] of desired) {
+    const norm = [...new Set(tagids.map(Number))].sort((a, b) => a - b);
+    const sig = norm.join(',');
+    if (!bySig.has(sig)) bySig.set(sig, { tagids: norm, mids: [] });
+    bySig.get(sig).mids.push(String(mid));
+  }
+  const ops = [];
+  for (const { tagids, mids } of bySig.values()) {
+    for (const part of chunk(mids, batchSize)) {
+      ops.push({
+        key: 'usertags:' + tagids.join('_') + ':' + part.join('_'),
+        label: '把 ' + part.length + ' 个 UP 的分组设为 [' + (labelOf ? tagids.map(labelOf).join(', ') : tagids.join(', ')) + ']',
+        op: 'tagAdd',
+        weight: part.length,
+        run: () => bili.setUserTags(part, tagids),
+      });
+    }
+  }
+  return ops;
+}
+
 /** 批量打分组标签：一次最多塞一批 mid */
 export function buildTagOps(bili, assignments, batchSize = 20) {
   const ops = [];
@@ -226,7 +311,8 @@ export function buildTagOps(bili, assignments, batchSize = 20) {
  * 收藏夹分类：先建所需的新夹，再按批移动/复制。
  * folderIds 是一个 Map<分类名, mediaId>，执行中会被就地补全（新建的夹回填进去）。
  */
-export function buildFavOps(bili, favPlan, folderIds, { mode = 'copy', moveChunk = 20, privacy = 1 } = {}) {
+export function buildFavOps(bili, favPlan, folderIds, { mode = 'copy', moveChunk = 20, privacy = 1, order = 'original', orderScope = 'per-source', chunkSize = null } = {}) {
+  const size = chunkSize ?? moveChunk;
   const ops = [];
   // 建夹的幂等性靠「这个名字的夹是不是真的存在」来保证，而不是靠断点文件。
   // 否则断点说建过了、夹其实不在（被手动删了 / 建到一半失败），后续移动会全部落空。
@@ -262,48 +348,49 @@ export function buildFavOps(bili, favPlan, folderIds, { mode = 'copy', moveChunk
     }
   }
   for (const p of favPlan.plan) {
-    // 同一批里可能混着来自不同源收藏夹的条目，move 接口要求 src 单一，所以按源分组
-    const bySrc = new Map();
-    for (const it of p.items) {
-      const src = it.srcMediaId;
-      if (!bySrc.has(src)) bySrc.set(src, []);
-      bySrc.get(src).push(it);
-    }
-    for (const [src, list] of bySrc) {
-      for (const part of chunk(list, moveChunk)) {
-        ops.push({
-          key: (mode === 'move' ? 'mv:' : 'cp:') + src + ':' + p.category + ':' + part.map((x) => x.id).join('_'),
-          label: (mode === 'move' ? '移动 ' : '复制 ') + part.length + ' 条到「' + p.category + '」',
-          op: 'favMove',
-          weight: 1,
-          run: async () => {
-            const tar = folderIds.get(p.category);
-            if (!tar) return { code: -1, message: '目标收藏夹「' + p.category + '」尚未创建成功，跳过' };
-            const res = part.map(toResource);
-            return mode === 'move'
-              ? bili.moveResources(src, tar, res)
-              : bili.copyResources(src, tar, res);
-          },
-        });
-      }
+    // 提交顺序决定条目在新夹里的排列，见 order.mjs 顶部的推导。
+    // move 接口要求单一 src_media_id，所以切批时必须在来源边界处断开。
+    const ordered = orderItems(p.items, order);
+    for (const { src, items: part } of chunkBySource(ordered, { chunkSize: size, scope: orderScope })) {
+      ops.push({
+        key: (mode === 'move' ? 'mv:' : 'cp:') + src + ':' + p.category + ':' + part.map((x) => x.id).join('_'),
+        label: (mode === 'move' ? '移动 ' : '复制 ') + part.length + ' 条到「' + p.category + '」',
+        op: 'favMove',
+        weight: 1,
+        run: async () => {
+          const tar = folderIds.get(p.category);
+          if (!tar) return { code: -1, message: '目标收藏夹「' + p.category + '」尚未创建成功，跳过' };
+          const res = part.map(toResource);
+          return mode === 'move'
+            ? bili.moveResources(src, tar, res)
+            : bili.copyResources(src, tar, res);
+        },
+      });
     }
   }
   return ops;
 }
 
 /** 失效视频清理 */
-export function buildDeadOps(bili, deadPlan, archiveId, { delChunk = 20 } = {}) {
+export function buildDeadOps(bili, deadPlan, archiveId, { delChunk = 20, order = 'original', chunkSize = null } = {}) {
+  const size = chunkSize ?? delChunk;
   const ops = [];
   for (const g of deadPlan.groups) {
-    for (const part of chunk(g.items, delChunk)) {
+    // 归档时同样决定了条目在归档夹里的排列；移除时排序无意义但也无害
+    for (const part of chunk(orderItems(g.items, order), size)) {
       const res = part.map(toResource);
       ops.push({
         key: deadPlan.action + ':' + g.mediaId + ':' + part.map((x) => x.id).join('_'),
         label: (deadPlan.action === 'archive' ? '归档 ' : '移除 ') + part.length + ' 条失效视频（源夹 ' + g.mediaId + '）',
         op: 'favDeal',
-        run: () => deadPlan.action === 'archive'
-          ? bili.moveResources(g.mediaId, archiveId, res)
-          : bili.batchDel(g.mediaId, res),
+        // archiveId 可以是值，也可以是惰性取值函数 —— 归档夹可能要等前面的建夹 op
+        // 跑完才有 id，和 buildFavOps 里 folderIds 的回填是同一套路子
+        run: () => {
+          if (deadPlan.action !== 'archive') return bili.batchDel(g.mediaId, res);
+          const tar = typeof archiveId === 'function' ? archiveId() : archiveId;
+          if (tar == null) return { code: -1, message: '归档夹尚未创建成功，跳过本批' };
+          return bili.moveResources(g.mediaId, tar, res);
+        },
       });
     }
   }
@@ -314,13 +401,14 @@ export function buildDeadOps(bili, deadPlan, archiveId, { delChunk = 20 } = {}) 
  * 合并：把来源夹的条目搬进目标夹。
  * 失效条目单独成批 —— 万一接口拒收失效条目，不会把同批的正常视频一起拖下水。
  */
-export function buildMergeOps(bili, mergePlan, { chunkSize = 20 } = {}) {
+export function buildMergeOps(bili, mergePlan, { chunkSize = 20, order = 'original' } = {}) {
   const ops = [];
   const tar = mergePlan.target.id;
   for (const g of mergePlan.groups) {
+    // 每组的 src 已经固定，只需组内排序；失效条目仍旧单独成批
     const batches = [
-      ...chunk(g.live, chunkSize).map((part) => ({ part, dead: false })),
-      ...chunk(g.dead, chunkSize).map((part) => ({ part, dead: true })),
+      ...chunk(orderItems(g.live, order), chunkSize).map((part) => ({ part, dead: false })),
+      ...chunk(orderItems(g.dead, order), chunkSize).map((part) => ({ part, dead: true })),
     ];
     for (const { part, dead } of batches) {
       ops.push({
@@ -369,6 +457,97 @@ export function buildLayoutOps(bili, renames, creates, folderIds, { privacy = 1 
         return body;
       },
     });
+  }
+  return ops;
+}
+
+/**
+ * 批量改收藏夹隐私。
+ *
+ * folder/edit 是整体覆盖语义（title/intro/privacy 缺一项就清空那一项），而收藏夹列表
+ * 接口根本不返回 intro —— 所以每个 op 都在执行时现读一遍 folderInfo，拿当前的
+ * title/intro 原样回传，只换 privacy。读不到详情就**跳过**：宁可这个夹没改成，
+ * 也不能拿一个空 intro 去把用户的简介覆盖掉。
+ *
+ * 幂等同样按实际状态判断（见建夹那条约束）：已经是目标隐私的夹直接跳过，不写。
+ */
+export function buildPrivacyOps(bili, folders, privacy) {
+  const want = privacy === PRIVACY.public ? PRIVACY.public : PRIVACY.private;
+  const word = want === PRIVACY.public ? '公开' : '私密';
+  return folders.map((f) => ({
+    key: 'privacy:' + f.id + ':' + want,
+    label: '「' + f.title + '」→ ' + word + '（id ' + f.id + '）',
+    op: 'folderAdd',
+    run: async () => {
+      const info = await bili.folderInfo(f.id);
+      if (!info) {
+        return { code: -1, message: '读不到收藏夹 ' + f.id + ' 的详情，跳过 —— 不拿空 intro 去覆盖简介' };
+      }
+      if (isPrivateAttr(info.attr) === (want === PRIVACY.private)) {
+        return { code: 0, _already: true };
+      }
+      return bili.editFolder(f.id, { title: info.title, intro: info.intro, privacy: want });
+    },
+  }));
+}
+
+/**
+ * 夹内重排。
+ *
+ * B 站没有「夹内排序」接口：条目次序完全由 fav_time 决定，而 fav_time 只有在
+ * move/copy 进一个**不同的**夹时才会被重写。实测 src==tar 的 copy 和 move 都返回
+ * code:0 却什么都没做（静默空操作，`probes.json` 的 fav-order-inplace）。
+ * 所以唯一可行的办法是来回搬一趟：
+ *
+ *     原夹 ──全部搬出──▶ 中转夹 ──按目标次序搬回──▶ 原夹
+ *
+ * 次序的推导见 order.mjs：**提交顺序的逆序 = 最终显示顺序**，想排最前的必须最后提交。
+ * 搬出那趟不影响最终次序，所以不排序。
+ *
+ * ## 批次不能跨条目类型
+ *
+ * 同一批的 fav_time 完全相同，此时 B 站打破并列的规则**因类型而异**：番剧类
+ * （type=24）会被排到同批的普通视频（type=2）前面。实测 3809 条里有 4 条番剧
+ * 因此跳到了所在块的最前。
+ *
+ * 所以切批时遇到类型变化就断开 —— 让每一批只含一种类型，并列就不存在了。
+ * 这和 chunkBySource「一批只能有一个来源夹」是同一类约束，直接复用它。
+ * 代价是类型交错处会多出几个不满 20 的碎块。
+ *
+ * ## key 里为什么要带 planId
+ *
+ * 断点 key 必须能区分「同一份计划的续跑」和「另起的一份新计划」。少了这一层，
+ * 上一轮已完成的 key 会被新计划原样撞上 —— 搬出批次的 key 只由夹 id 和条目
+ * 构成，两份计划里往往一模一样，于是新计划的搬出被当成「已做过」而跳过，
+ * 条目根本没进中转夹，后续搬回全部搬空。这是实际踩过的坑，不是假想。
+ *
+ * @param {Array} jobs [{ id, title, out: 待搬出条目, ordered: 已按提交顺序排好的条目 }]
+ * @param {object} temp 中转夹句柄 { id }，id 可以在执行期才被建夹 op 回填
+ * @param {string} planId 这份计划的唯一标识，续跑时必须沿用同一个值
+ */
+export function buildReorderOps(bili, jobs, temp, { chunkSize = 20, planId = '' } = {}) {
+  const ops = [];
+  const tag = planId ? String(planId) + ':' : '';
+  for (const j of jobs) {
+    // 搬出不影响最终次序，怎么切都行
+    for (const part of chunk(j.out, chunkSize)) {
+      ops.push({
+        key: 'ro-out:' + tag + j.id + ':' + part.map((x) => x.id).join('_'),
+        label: '「' + j.title + '」搬出 ' + part.length + ' 条到中转夹',
+        op: 'favMove',
+        run: () => bili.moveResources(j.id, temp.id, part.map(toResource)),
+      });
+    }
+    // 搬回决定次序：一批只能有一种类型
+    const batches = chunkBySource(j.ordered, { chunkSize, scope: 'global', srcOf: (it) => it.type ?? 2 });
+    for (const { items: part } of batches) {
+      ops.push({
+        key: 'ro-in:' + tag + j.id + ':' + part.map((x) => x.id).join('_'),
+        label: '「' + j.title + '」搬回 ' + part.length + ' 条',
+        op: 'favMove',
+        run: () => bili.moveResources(temp.id, j.id, part.map(toResource)),
+      });
+    }
   }
   return ops;
 }

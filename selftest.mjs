@@ -3,6 +3,8 @@ import { planUnfollow, planFavClassify, planDeadCleanup, chunk, toResource } fro
 import { classifyAll, scoreItem, DEFAULT_RULES } from './src/classify/keyword.mjs';
 import { extractJson } from './src/classify/ai.mjs';
 import { RiskEngine, classifyResult, RISK_CODES, AUTH_CODES } from './src/risk.mjs';
+import { orderItems } from './src/order.mjs';
+import { isPrivateAttr } from './src/bili.mjs';
 
 let pass = 0, fail = 0;
 const eq = (name, got, want) => {
@@ -46,9 +48,14 @@ const mkUsers = (n, t0 = 1_700_000_000) =>
     ['1002', { lastPubTs: null, count: 0 }],                   // 零投稿
   ]);
   const p = planUnfollow(all, { onlyInactive: true, inactiveDays: 180, inactive });
-  eq('只取关停更号：命中 2 个', p.targets.length, 2);
+  eq('只取关停更号：命中 1 个（零投稿号默认不算）', p.targets.length, 1);
   ok('活跃号被保留', !p.targets.some((u) => u.mid === '1001'));
-  ok('零投稿号被判为停更', p.targets.some((u) => u.mid === '1002'));
+  ok('零投稿号默认不判停更（count=0 含义不明确，实测过对活跃大号也会返回 0）',
+    !p.targets.some((u) => u.mid === '1002'));
+  {
+    const p2 = planUnfollow(all, { onlyInactive: true, inactiveDays: 180, inactive, zeroUploadIsStale: true });
+    ok('显式 opt-in 后零投稿号才算停更', p2.targets.some((u) => u.mid === '1002'));
+  }
 }
 {
   const all = mkUsers(6);
@@ -237,10 +244,74 @@ section('风控引擎');
   eq('超过 24h 的事件不计入热度', r.status(now).heat, 0);
 }
 {
+  // 读写预算分离：一次 4000 次的只读扫描不该把写操作的热度顶到 red
+  const { RiskEngine, READ_SAFE_PER_MIN } = await import('./src/risk.mjs');
+  const r = new RiskEngine();
+  for (let i = 0; i < 4000; i++) r.record('read', 1);
+  const s = r.status();
+  eq('大量读操作不推高热度', s.heat, 0);
+  eq('读级别仍是 green', s.level, 'green');
+  ok('但读速率被单独观测到', s.readPerMin > 0);
+  ok('并被标记为超速', s.readTooFast === true);
+
+  const r2 = new RiskEngine();
+  for (let i = 0; i < 30; i++) r2.record('unfollow', 1);
+  ok('写操作照常推高热度', r2.status().heat > 0);
+  eq('写操作不污染读速率', r2.status().readPerMin, 0);
+
+  const r3 = new RiskEngine();
+  for (let i = 0; i < 100; i++) r3.record('read', 1);   // 100 次 / 5 分钟窗口 = 20 次/分
+  ok('低速读不报超速', r3.status().readTooFast === false);
+  ok('实测安全上限有明确取值', READ_SAFE_PER_MIN >= 40 && READ_SAFE_PER_MIN <= 60);
+}
+{
   const r = new RiskEngine();
   eq('零事件时为 green', r.status().level, 'green');
   eq('green 无附加静默', r.levelPauseMs('green'), 0);
   ok('red 附加静默最久', r.levelPauseMs('red') > r.levelPauseMs('orange'));
+}
+
+// ---------- 收藏夹隐私位 ----------
+section('收藏夹隐私位');
+{
+  // 隐私只在 attr 的最低位，其余位是别的含义。实测样本：默认夹 0/1，普通夹 22/23，
+  // 还见过 54/55（= 22/23 再加一个含义未知的 bit5）。所以绝不能拿 attr 去和
+  // 22/23 这种具体值比 —— 那样会把带额外位的夹整个漏掉。
+  ok('attr=0（默认夹）是公开', !isPrivateAttr(0));
+  ok('attr=1（默认夹）是私密', isPrivateAttr(1));
+  ok('attr=22（普通夹）是公开', !isPrivateAttr(22));
+  ok('attr=23（普通夹）是私密', isPrivateAttr(23));
+  ok('attr=54 带额外位仍认得出公开', !isPrivateAttr(54));
+  ok('attr=55 带额外位仍认得出私密', isPrivateAttr(55));
+  ok('attr 缺失时不炸，按公开处理', !isPrivateAttr(undefined));
+}
+
+// ---------- 提交顺序 ----------
+section('提交顺序');
+{
+  // order.mjs 的核心规律：**提交顺序的逆序 = 最终显示顺序**。
+  // 想排最前的必须最后提交 —— 这条弄反就会得到「最旧的收藏浮在最上面」。
+  const items = [
+    { id: 'a', favTime: 300, pubTime: 10 },
+    { id: 'b', favTime: 100, pubTime: 30 },
+    { id: 'c', favTime: 200, pubTime: 20 },
+  ];
+  const submitted = orderItems(items, 'original').map((x) => x.id);
+  eq('original 按 favTime 升序提交', submitted, ['b', 'c', 'a']);
+  eq('最后提交的是收藏时间最新的 a —— 它才会显示在最上面', submitted[submitted.length - 1], 'a');
+  eq('reverse 按 favTime 降序提交', orderItems(items, 'reverse').map((x) => x.id), ['a', 'c', 'b']);
+  eq('pubdate 按投稿时间升序提交', orderItems(items, 'pubdate').map((x) => x.id), ['a', 'c', 'b']);
+  eq('as-scanned 原样不动', orderItems(items, 'as-scanned').map((x) => x.id), ['a', 'b', 'c']);
+
+  const tie = [{ id: 'x', favTime: 5 }, { id: 'y', favTime: 5 }, { id: 'z', favTime: 5 }];
+  eq('时间戳相同时保持原有相对次序（稳定排序）', orderItems(tie, 'original').map((x) => x.id), ['x', 'y', 'z']);
+
+  const missing = [{ id: 'p' }, { id: 'q' }];
+  eq('没有时间戳的条目不乱序', orderItems(missing, 'original').map((x) => x.id), ['p', 'q']);
+
+  let threw = false;
+  try { orderItems(items, '瞎写的'); } catch { threw = true; }
+  ok('未知排序方式立刻抛错，不静默走默认', threw);
 }
 
 console.log('\n' + '='.repeat(56));

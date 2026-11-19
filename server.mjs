@@ -37,16 +37,29 @@ const app = {
   sse: new Set(),
 };
 
-const cfg = () => store.read('config.json', {
-  cdpPort: 9222,
-  dryRunDefault: true,
-  folderQuota: 20,
-  perFolderCap: 1000,
-  privacy: 1,
-  risk: {},
-  ai: { provider: 'deepseek', apiKey: '', model: '', baseUrl: '', chunkSize: 25, concurrency: 2 },
-  rules: DEFAULT_RULES,
-});
+/**
+ * 逐键兜底。原本写的是 store.read('config.json', DEFAULTS)，而那个默认值**只在
+ * 文件不存在时生效** —— 用户手改出一个局部 config.json（比如只写了 cdpPort），
+ * 其余默认值就全丢了，/api/status 里的 c.ai.apiKey 直接 TypeError。
+ * CLI 侧一直是 spread 写法，这里对齐。
+ */
+const cfg = () => {
+  const c = store.read('config.json', {}) ?? {};
+  return {
+    cdpPort: 9222,
+    dryRunDefault: true,
+    folderQuota: 20,
+    perFolderCap: 1000,
+    privacy: 1,
+    rules: DEFAULT_RULES,
+    ...c,
+    risk: { ...(c.risk ?? {}) },
+    ai: {
+      provider: 'deepseek', apiKey: '', model: '', baseUrl: '', chunkSize: 25, concurrency: 2,
+      ...(c.ai ?? {}),
+    },
+  };
+};
 
 function broadcast(ev) {
   const line = 'data: ' + JSON.stringify(ev) + '\n\n';
