@@ -6,6 +6,7 @@ import { RiskEngine, classifyResult, sleep } from './risk.mjs';
 import * as store from './store.mjs';
 import { chunk, toResource } from './plan.mjs';
 import { orderItems, chunkBySource } from './order.mjs';
+import { PRIVACY, isPrivateAttr } from './bili.mjs';
 
 export class Job {
   constructor(id, kind, { dryRun = true, riskOpts = {}, resumeKey = null } = {}) {
@@ -456,6 +457,97 @@ export function buildLayoutOps(bili, renames, creates, folderIds, { privacy = 1 
         return body;
       },
     });
+  }
+  return ops;
+}
+
+/**
+ * 批量改收藏夹隐私。
+ *
+ * folder/edit 是整体覆盖语义（title/intro/privacy 缺一项就清空那一项），而收藏夹列表
+ * 接口根本不返回 intro —— 所以每个 op 都在执行时现读一遍 folderInfo，拿当前的
+ * title/intro 原样回传，只换 privacy。读不到详情就**跳过**：宁可这个夹没改成，
+ * 也不能拿一个空 intro 去把用户的简介覆盖掉。
+ *
+ * 幂等同样按实际状态判断（见建夹那条约束）：已经是目标隐私的夹直接跳过，不写。
+ */
+export function buildPrivacyOps(bili, folders, privacy) {
+  const want = privacy === PRIVACY.public ? PRIVACY.public : PRIVACY.private;
+  const word = want === PRIVACY.public ? '公开' : '私密';
+  return folders.map((f) => ({
+    key: 'privacy:' + f.id + ':' + want,
+    label: '「' + f.title + '」→ ' + word + '（id ' + f.id + '）',
+    op: 'folderAdd',
+    run: async () => {
+      const info = await bili.folderInfo(f.id);
+      if (!info) {
+        return { code: -1, message: '读不到收藏夹 ' + f.id + ' 的详情，跳过 —— 不拿空 intro 去覆盖简介' };
+      }
+      if (isPrivateAttr(info.attr) === (want === PRIVACY.private)) {
+        return { code: 0, _already: true };
+      }
+      return bili.editFolder(f.id, { title: info.title, intro: info.intro, privacy: want });
+    },
+  }));
+}
+
+/**
+ * 夹内重排。
+ *
+ * B 站没有「夹内排序」接口：条目次序完全由 fav_time 决定，而 fav_time 只有在
+ * move/copy 进一个**不同的**夹时才会被重写。实测 src==tar 的 copy 和 move 都返回
+ * code:0 却什么都没做（静默空操作，`probes.json` 的 fav-order-inplace）。
+ * 所以唯一可行的办法是来回搬一趟：
+ *
+ *     原夹 ──全部搬出──▶ 中转夹 ──按目标次序搬回──▶ 原夹
+ *
+ * 次序的推导见 order.mjs：**提交顺序的逆序 = 最终显示顺序**，想排最前的必须最后提交。
+ * 搬出那趟不影响最终次序，所以不排序。
+ *
+ * ## 批次不能跨条目类型
+ *
+ * 同一批的 fav_time 完全相同，此时 B 站打破并列的规则**因类型而异**：番剧类
+ * （type=24）会被排到同批的普通视频（type=2）前面。实测 3809 条里有 4 条番剧
+ * 因此跳到了所在块的最前。
+ *
+ * 所以切批时遇到类型变化就断开 —— 让每一批只含一种类型，并列就不存在了。
+ * 这和 chunkBySource「一批只能有一个来源夹」是同一类约束，直接复用它。
+ * 代价是类型交错处会多出几个不满 20 的碎块。
+ *
+ * ## key 里为什么要带 planId
+ *
+ * 断点 key 必须能区分「同一份计划的续跑」和「另起的一份新计划」。少了这一层，
+ * 上一轮已完成的 key 会被新计划原样撞上 —— 搬出批次的 key 只由夹 id 和条目
+ * 构成，两份计划里往往一模一样，于是新计划的搬出被当成「已做过」而跳过，
+ * 条目根本没进中转夹，后续搬回全部搬空。这是实际踩过的坑，不是假想。
+ *
+ * @param {Array} jobs [{ id, title, out: 待搬出条目, ordered: 已按提交顺序排好的条目 }]
+ * @param {object} temp 中转夹句柄 { id }，id 可以在执行期才被建夹 op 回填
+ * @param {string} planId 这份计划的唯一标识，续跑时必须沿用同一个值
+ */
+export function buildReorderOps(bili, jobs, temp, { chunkSize = 20, planId = '' } = {}) {
+  const ops = [];
+  const tag = planId ? String(planId) + ':' : '';
+  for (const j of jobs) {
+    // 搬出不影响最终次序，怎么切都行
+    for (const part of chunk(j.out, chunkSize)) {
+      ops.push({
+        key: 'ro-out:' + tag + j.id + ':' + part.map((x) => x.id).join('_'),
+        label: '「' + j.title + '」搬出 ' + part.length + ' 条到中转夹',
+        op: 'favMove',
+        run: () => bili.moveResources(j.id, temp.id, part.map(toResource)),
+      });
+    }
+    // 搬回决定次序：一批只能有一种类型
+    const batches = chunkBySource(j.ordered, { chunkSize, scope: 'global', srcOf: (it) => it.type ?? 2 });
+    for (const { items: part } of batches) {
+      ops.push({
+        key: 'ro-in:' + tag + j.id + ':' + part.map((x) => x.id).join('_'),
+        label: '「' + j.title + '」搬回 ' + part.length + ' 条',
+        op: 'favMove',
+        run: () => bili.moveResources(temp.id, j.id, part.map(toResource)),
+      });
+    }
   }
   return ops;
 }

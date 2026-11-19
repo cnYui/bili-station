@@ -12,6 +12,16 @@ const API = 'https://api.bilibili.com';
 export const SPECIAL_TAG_ID = -10;
 export const DEFAULT_TAG_ID = 0;
 
+/** folder/edit 的 privacy 取值 */
+export const PRIVACY = { public: 0, private: 1 };
+
+/**
+ * 收藏夹的隐私位藏在 attr 的最低位（0 公开 / 1 私密），其余位是别的含义，读时必须只看 bit0。
+ * 实测样本：默认夹公开=0，普通夹公开=22、私密=23，还见过 55（= 23 + bit5，含义未知）。
+ * 所以**不能**拿 attr 去和 22/23 这种具体数值比，那样会漏掉带额外位的夹。
+ */
+export const isPrivateAttr = (attr) => ((Number(attr) || 0) & 1) === 1;
+
 /**
  * /x/relation/modify 的 act 取值。
  *
@@ -367,14 +377,43 @@ export class Bili {
     return this.post(API + '/x/v3/fav/folder/add', { title, privacy: String(privacy) });
   }
 
-  /** 收藏夹改名。B 站 folder/edit 要求把 title/intro/privacy 一起回传，缺字段会被清空。 */
-  renameFolder(mediaId, title, { intro = '', privacy = 1 } = {}) {
+  /**
+   * 单个收藏夹的详情。
+   *
+   * 存在的理由只有一个：`list-all` **不返回 intro**，而 folder/edit 是整体覆盖语义，
+   * 少传 intro 就会把简介清空。所以任何「只想改其中一项」的编辑，都必须先读这里
+   * 拿到当前的 title/intro 再原样回传。
+   */
+  async folderInfo(mediaId) {
+    const r = await this.get(API + '/x/v3/fav/folder/info?media_id=' + mediaId);
+    if (r?.code !== 0) return null;
+    const d = r.data ?? {};
+    return {
+      id: d.id,
+      title: d.title ?? '',
+      intro: d.intro ?? '',
+      attr: d.attr ?? 0,
+      count: d.media_count ?? 0,
+      private: isPrivateAttr(d.attr),
+    };
+  }
+
+  /**
+   * 收藏夹编辑。B 站 folder/edit 要求把 title/intro/privacy 一起回传，缺字段会被清空 ——
+   * 所以调用方必须先 folderInfo() 读出当前值，改掉要改的那一项再整体回传。
+   */
+  editFolder(mediaId, { title, intro = '', privacy = 1 }) {
     return this.post(API + '/x/v3/fav/folder/edit', {
       media_id: String(mediaId),
       title,
       intro,
       privacy: String(privacy),
     });
+  }
+
+  /** 收藏夹改名 —— editFolder 的一个特例 */
+  renameFolder(mediaId, title, { intro = '', privacy = 1 } = {}) {
+    return this.editFolder(mediaId, { title, intro, privacy });
   }
 
   /** 删除收藏夹（夹里的条目会一起没）。不可逆，上层必须先备份。 */

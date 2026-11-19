@@ -32,7 +32,7 @@ const { loadConfig } = await import('./src/cli/context.mjs');
 const { runCommand } = await import('./src/cli/runner.mjs');
 const { rootHelp, commandHelp, schema } = await import('./src/cli/help.mjs');
 
-for (const m of ['status', 'folders', 'scan', 'sort', 'merge', 'dead', 'follow', 'unfollow', 'probe']) {
+for (const m of ['status', 'folders', 'scan', 'sort', 'reorder', 'merge', 'dead', 'follow', 'unfollow', 'probe']) {
   register((await import(`./src/cli/commands/${m}.mjs`)).default);
 }
 
